@@ -8,9 +8,41 @@ Background for all of it is in `POSTMORTEM.md` (what was broken) and
 
 ---
 
-## 1. Build a measurement you can trust
+## 1. Remove the fake contract-switch moves from the CL target
 
-**Do this before anything else.**
+**Small, and it sits under every number — do it first.**
+
+Futures contracts expire, so a long crude oil price history has to be
+stitched together from many contracts. Our tape is Databento's `CL.c.0`,
+which follows the front-month contract and switches to the next one at
+each roll *without adjusting prices*. Two neighbouring contracts trade at
+different prices, so every switch shows up as a price move that nobody
+actually traded.
+
+The data covers 19 contracts, so there are 18 switches, and each one puts
+a fake return into the forward-return target: median 0.95%, largest
+2.14%, 14 of the 18 downward. A typical bar-to-bar move is about 0.5%, so
+these are two to four times normal size — enough to carry extra weight in
+training and tilt the target downward. Every result in `POSTMORTEM.md`
+includes them.
+
+**The fix.** Every trade is tagged with the contract it belongs to
+(`instrument_id`), so the switch points are known exactly. Drop any target
+return whose bar spans a change of contract. Then check whether VPIN,
+Kyle's Lambda and Hawkes — which are built from price changes — also see
+the jumps, and mask them there too if so. A fuller fix adjusts the whole
+history so the series has no jumps at all; that belongs with the roll
+calendar in `FALL_2026_TASKS.md` H2.
+
+**How to know you succeeded:** a test that no target return spans a
+contract switch, and `validate_pipeline.py` still passes. Expect the
+headline numbers to move, and re-run the seed matrix before quoting any.
+
+---
+
+## 2. Build a measurement you can trust
+
+**Do this before any tuning.**
 
 Right now the number everyone quotes — the Sharpe ratio — does not work.
 We tested it by scrambling the answer key: we shuffled the thing the model
@@ -41,7 +73,7 @@ it isn't a metric. Run `validate_pipeline.py` to check.
 
 ---
 
-## 2. Decide whether you're predicting hours or days
+## 3. Decide whether you're predicting hours or days
 
 The model predicts the return of the **next dollar bar**. There are about
 12 bars per trading day, so it is forecasting roughly the next two hours.
@@ -58,7 +90,7 @@ parameter tuning in the old run history.
 
 ---
 
-## 3. Get tick data for more contracts
+## 4. Get tick data for more contracts
 
 **This is what actually blocks the multi-asset project.**
 
@@ -80,7 +112,7 @@ and everything downstream waits on it.
 
 ---
 
-## 4. Make the pipeline handle more than one symbol
+## 5. Make the pipeline handle more than one symbol
 
 `run_backtest.py` is currently one very long function with "CL" assumptions
 threaded all the way through. To run ten markets you need to be able to say
@@ -100,7 +132,7 @@ we just fixed were misalignment bugs that nothing detected for months.
 
 ---
 
-## 5. Change the question from "will CL go up" to "which market looks best"
+## 6. Change the question from "will CL go up" to "which market looks best"
 
 This is the actual research idea, and Rebecca's reason for expecting the
 current results to stay poor no matter how much they're tuned.
@@ -128,7 +160,7 @@ in testing.
 
 ---
 
-## 6. Smaller things, whenever
+## 7. Smaller things, whenever
 
 - **Run the falsification suite with more seeds.** We used three, which is
   enough to show the metric is broken but not enough to measure precisely
@@ -140,13 +172,12 @@ in testing.
   prove on that. More history would help; so would more markets (see above),
   since ten markets over the same window give ten times the observations.
 
-- **GammaExposure is still not wired in.** It needs gamma data that was
-  never delivered. Either chase it or delete the stub so nobody assumes
-  it's running — right now the code sets it to `None` unconditionally.
-
-- **Dead code in `backtesting/visualize_backtest.py`.** The demo block at
-  the bottom imports a module (`lob_kernel`) that doesn't exist in this
-  repo, so it cannot run. Fix it or delete it.
+- **Gamma Exposure is wired but needs data.** It is waiting on one more
+  Greek (gamma) from Anders, or from OptionMetrics if WRDS has it. An
+  earlier stand-in built from options open interest added noise in Run 6,
+  so the pipeline leaves it off (`gex_feats = None` in `run_backtest.py`)
+  until real gamma arrives. Keep the code — do not delete it. Note that
+  Run 6 was on the pre-fix pipeline, so it says nothing about real gamma.
 
 - **The old run history is kept but invalid.** `results_table.txt`,
   `next_steps.txt`, `run_configs.txt` and `pipeline.txt` still contain the
@@ -155,7 +186,8 @@ in testing.
   find people quoting them anyway, delete them.
 
 - **Check the transaction cost assumption.** Costs are modelled as a flat
-  0.015% per trade, roughly one tick on CL at $70/barrel. That's a
+  0.015% per trade, roughly one tick on CL ($0.01/bbl, $10 a contract) at
+  $70/barrel. That's a
   reasonable guess for CL and probably wrong for other contracts. Revisit
   when the book expands.
 

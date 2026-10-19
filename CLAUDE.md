@@ -97,8 +97,9 @@ construction, alignment, or the walk-forward engine.
 `backtesting/test_pipeline.py` was removed: it imported a module
 `lob_kernel` that does not exist in this repo, so the "11 synthetic
 end-to-end tests" it was credited with had not run in a long time. The
-demo block at the bottom of `backtesting/visualize_backtest.py` imports
-the same missing module and is likewise dead.
+synthetic-data demo at the bottom of `backtesting/visualize_backtest.py`
+imported the same missing module and was removed too; the figure
+functions remain.
 
 `figures/` and `reports/` are no longer tracked — every chart in them was
 generated from the pre-fix pipeline. Regenerate them with the commands
@@ -137,13 +138,17 @@ Stage 1 fits per-kernel KRR predictions; Stage 2 combines them with a
 walk-forward ElasticNet. The combined prediction is Kalman-filtered into an
 s-score with regime-conditional entry/exit thresholds, gated by momentum
 regime and event proximity. Evaluation is daily, 8 expanding walk-forward
-folds with a 100-bar embargo, 1-tick ($10) transaction cost per trade.
+folds with a 100-bar embargo, and a transaction cost of 0.015% per trade
+(`COST_PER_TRADE=0.00015`) — about one tick ($0.01/bbl, $10 a contract)
+at $70 crude.
 
 All fast kernels are resampled onto a single master $1M dollar-bar
 schedule by wall clock (`feature_alignment.py`), and all slow kernels onto
 a single daily date axis, before anything is combined. The forward-return
 target comes from dollar-bar closes and is checked for degeneracy on every
-fold. The old claim that the kernels act as a noise filter — "null test
+fold. **Known open bug:** the CL tape is Databento's `CL.c.0`, which joins
+19 contracts without adjusting prices, so the target still contains 18
+fake returns at the contract switches — see `TODO.md` item 1. The old claim that the kernels act as a noise filter — "null test
 gives Sharpe -0.76 vs +1.55 with kernels" — was measured on the buggy
 pipeline. It has now been re-run properly: with every prediction feature
 replaced by iid noise the pipeline scores 1.18 ± 1.25 against the real

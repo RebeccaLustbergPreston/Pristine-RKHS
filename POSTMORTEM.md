@@ -255,14 +255,23 @@ be a draw from a ±1.2 distribution until shown otherwise.
   a nonexistent `lob_kernel` module, so the "11 synthetic end-to-end
   tests" it was credited with had not run in a long time) and
   `run_mkl_optimize.py` (still contained bugs 1 and 2 verbatim and would
-  have reproduced the fake result). The demo block at the bottom of
-  `backtesting/visualize_backtest.py` imports the same missing
-  `lob_kernel` and is likewise dead — left in place, but do not trust it.
+  have reproduced the fake result). The synthetic-data demo at the bottom
+  of `backtesting/visualize_backtest.py` imported the same missing
+  `lob_kernel`; it was later removed as well.
   `test_feature_alignment.py` (21 tests) is what currently passes.
 - **`figures/` and `reports/` are no longer tracked.** Every chart in them
   came from the pre-fix pipeline. Regenerate after a run.
-- **The null test is invalid.** The "no kernels → Sharpe −0.76 vs +1.55
-  with kernels" claim was measured on the buggy pipeline and has not been
-  re-run.
+- **The old null test is withdrawn.** The "no kernels → Sharpe −0.76 vs
+  +1.55 with kernels" claim was measured on the buggy pipeline. It has
+  since been re-run on the fixed pipeline — that is the `features → iid
+  noise` row above, 1.18 ± 1.25 against the real 0.28 ± 1.18 — so the
+  kernels are not distinguishable from random features on CL.
+- **Fake returns at contract switches — found, not yet fixed.** The CL
+  tape is Databento's `CL.c.0`, a continuous front-month series that joins
+  19 contracts end to end without adjusting prices. Each of the 18
+  switches shows up as a price move nobody traded, and those moves are in
+  the forward-return target: median 0.95%, largest 2.14%, 14 of 18
+  downward, against a typical bar-to-bar move of about 0.5%. Every result
+  above includes them. See `TODO.md` item 1.
 - Every number in `results_table.txt` and `next_steps.txt` for Runs 1–25
   predates this fix.

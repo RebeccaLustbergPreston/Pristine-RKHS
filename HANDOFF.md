@@ -154,12 +154,20 @@ and forward vol, reported per fold with seed dispersion, would be a start;
 the real pipeline from `NULL_MODE=shuffle_target`. If it cannot, it is not
 a metric.
 
-## Known dead code
+## Known open bug
 
-- The demo block at the bottom of `backtesting/visualize_backtest.py`
-  imports `lob_kernel`, which does not exist in this repo. It has not run
-  in a long time. `backtesting/test_pipeline.py` had the same import and
-  was removed.
+The CL tape is Databento's `CL.c.0`, which joins 19 contracts end to end
+without adjusting prices. The 18 contract switches put 18 fake returns
+into the forward-return target (median 0.95%, largest 2.14%, 14 of 18
+downward). Every current number includes them. `TODO.md` item 1 has the
+fix; do it before trusting any new measurement.
+
+## Removed dead code
+
+- `backtesting/test_pipeline.py` and the synthetic-data demo at the bottom
+  of `backtesting/visualize_backtest.py` both imported `lob_kernel`, which
+  does not exist in this repo, so neither had run in a long time. Both
+  were removed; the figure functions in `visualize_backtest.py` remain.
 - `figures/` and `reports/` are no longer tracked; every chart in them
   came from the pre-fix pipeline. Regenerate with `generate_charts.py` and
   `generate_report.py` after a run.
