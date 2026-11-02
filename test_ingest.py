@@ -1,0 +1,395 @@
+"""
+Tests for ingest.py — raw Databento .dbn.zst → data/<SYMBOL>/*.parquet.
+
+Run with: python test_ingest.py   (no market data required)
+
+Every fixture is a real DBN file written with Databento's own encoder, so
+the reader under test is the one that will read the real downloads. File and
+folder names in the fixtures are deliberately misleading: the ingester must
+go by what the header says.
+"""
+
+import datetime as dt
+import io
+import json
+import os
+import sys
+import tempfile
+from types import SimpleNamespace as _NS
+
+import pandas as pd
+import pyarrow.parquet as pq
+
+try:
+    import databento_dbn as dbn
+    import zstandard
+except ImportError:
+    print("SKIP: test_ingest needs the `databento` package (pip install -r requirements.txt)")
+    sys.exit(0)
+
+from ingest import IngestError, ingest, root_of, verify_output
+
+_failures = []
+NS = 10**9
+DAY = 86400 * NS
+
+
+def check(name, fn):
+    try:
+        fn()
+        print(f"  PASS  {name}")
+    except Exception as e:  # noqa: BLE001 — test harness
+        print(f"  FAIL  {name}: {type(e).__name__}: {e}")
+        _failures.append(name)
+
+
+# ── fixture writer ───────────────────────────────────────────────────────────
+
+def _ns(day: str) -> int:
+    return int(pd.Timestamp(day, tz="UTC").value)
+
+
+def _mapping(sym, iid, start, end):
+    return _NS(raw_symbol=sym, intervals=[_NS(
+        start_date=pd.Timestamp(start).date(), end_date=pd.Timestamp(end).date(),
+        symbol=str(iid))])
+
+
+def write_dbn(path, schema, symbols, start, end, records, mappings,
+              stype=dbn.SType.CONTINUOUS, dataset="GLBX.MDP3"):
+    md = dbn.Metadata(dataset=dataset, start=_ns(start), end=_ns(end),
+                      stype_in=stype, stype_out=dbn.SType.INSTRUMENT_ID,
+                      schema=schema, symbols=list(symbols), mappings=mappings)
+    buf = io.BytesIO()
+    buf.write(md.encode())
+    for r in records:
+        buf.write(bytes(r))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    data = buf.getvalue()
+    if path.endswith(".zst"):
+        data = zstandard.ZstdCompressor().compress(data)
+    with open(path, "wb") as fh:
+        fh.write(data)
+    return path
+
+
+def trades_file(path, sym, iid, start, end, n=3, price=3.0, first_ts=None, seq0=0,
+                recv_delay_ns=1234):
+    t0 = _ns(start) if first_ts is None else _ns(first_ts)
+    recs = [dbn.TradeMsg(publisher_id=1, instrument_id=iid, ts_event=t0 + i * NS,
+                         price=int((price + 0.001 * i) * NS), size=1 + i,
+                         action=dbn.Action.TRADE,
+                         side=[dbn.Side.ASK, dbn.Side.BID, dbn.Side.NONE][i % 3],
+                         depth=0, ts_recv=t0 + i * NS + recv_delay_ns, flags=0,
+                         sequence=seq0 + i)
+            for i in range(n)]
+    return write_dbn(path, dbn.Schema.TRADES, [sym], start, end, recs,
+                     [_mapping(sym, iid, start, end)])
+
+
+def full_ng_tree(raw):
+    """NG trades for two 'months' in job-named folders, plus 1-min bars,
+    definitions and statistics; names chosen to mislead."""
+    trades_file(f"{raw}/job-8812/CL_december.trades.dbn.zst", "NG.v.0", 101,
+                "2023-11-30", "2023-12-31", n=4)
+    trades_file(f"{raw}/job-9001/whatever.dbn.zst", "NG.v.0", 102,
+                "2023-12-31", "2024-01-31", n=5, price=2.5)
+    ohlcv = [dbn.OHLCVMsg(rtype=dbn.RType.OHLCV_1M, publisher_id=1, instrument_id=101,
+                          ts_event=_ns("2023-12-01") + i * 60 * NS, open=3 * NS,
+                          high=4 * NS, low=2 * NS, close=3 * NS, volume=10 + i)
+             for i in range(3)]
+    write_dbn(f"{raw}/misc/trades_NG.dbn.zst", dbn.Schema.OHLCV_1M, ["NG.v.0"],
+              "2023-11-30", "2024-01-31", ohlcv,
+              [_mapping("NG.v.0", 101, "2023-11-30", "2024-01-31")])
+    t = _ns("2023-12-01")
+    defs = [dbn.InstrumentDefMsg(
+        publisher_id=1, instrument_id=iid, ts_event=t, ts_recv=t,
+        min_price_increment=1_000_000, display_factor=NS, raw_symbol=raw_sym,
+        asset="NG", security_type="FUT", instrument_class=dbn.InstrumentClass.FUTURE,
+        security_update_action=dbn.SecurityUpdateAction.ADD,
+        expiration=t + 25 * DAY, unit_of_measure_qty=10_000 * NS,
+        min_price_increment_amount=10 * NS)
+        for iid, raw_sym in ((101, "NGZ3"), (102, "NGF4"))]
+    write_dbn(f"{raw}/defs.dbn", dbn.Schema.DEFINITION, ["NG.FUT"],
+              "2023-11-30", "2024-01-31", defs,
+              [_mapping("NGZ3", 101, "2023-11-30", "2024-01-31"),
+               _mapping("NGF4", 102, "2023-11-30", "2024-01-31")],
+              stype=dbn.SType.PARENT)
+    stats = [
+        dbn.StatMsg(publisher_id=1, instrument_id=101, ts_event=t, ts_recv=t, ts_ref=t,
+                    price=3 * NS, quantity=dbn.UNDEF_STAT_QUANTITY,
+                    stat_type=dbn.StatType.SETTLEMENT_PRICE),
+        dbn.StatMsg(publisher_id=1, instrument_id=101, ts_event=t, ts_recv=t, ts_ref=t,
+                    price=dbn.UNDEF_PRICE, quantity=12345,
+                    stat_type=dbn.StatType.OPEN_INTEREST),
+    ]
+    write_dbn(f"{raw}/stats/x.dbn.zst", dbn.Schema.STATISTICS, ["NG.FUT"],
+              "2023-11-30", "2024-01-31", stats,
+              [_mapping("NGZ3", 101, "2023-11-30", "2024-01-31")],
+              stype=dbn.SType.PARENT)
+
+
+def _quiet(*_a, **_k):
+    pass
+
+
+def _expect_error(fn, contains):
+    try:
+        fn()
+    except IngestError as e:
+        assert contains in str(e), f"wrong error: {e}"
+        return
+    raise AssertionError(f"expected IngestError mentioning {contains!r}")
+
+
+# ── tests ────────────────────────────────────────────────────────────────────
+
+def test_root_of_reads_every_symbology():
+    cases = {"NG.v.0": "NG", "CL.c.0": "CL", "ZC.n.1": "ZC", "NG.FUT": "NG",
+             "LO.OPT": "LO", "NGZ3": "NG", "ZCZ23": "ZC", "6EH4": "6E",
+             "NGZ3-NGF4": "NG", "LOZ3 C4800": "LO", "BTCZ3": "BTC",
+             "4242": None, "ALL_SYMBOLS": None, "NGZ3-CLF4": None}
+    for s, want in cases.items():
+        assert root_of(s) == want, f"{s}: {root_of(s)} != {want}"
+
+
+def test_end_to_end_writes_standard_layout():
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        full_ng_tree(raw)
+        m = ingest("NG", raw, out, log=_quiet)
+        for kind in ("trades", "ohlcv1m", "definitions", "statistics"):
+            assert os.path.exists(f"{out}/NG/{kind}.parquet"), kind
+            assert m["outputs"][kind]["checks_passed"], kind
+        assert os.path.exists(f"{out}/NG/ingest_manifest.json")
+        tr = pd.read_parquet(f"{out}/NG/trades.parquet")
+        assert len(tr) == 9, len(tr)
+        assert str(tr["ts_event"].dtype) == "datetime64[ns, UTC]"
+        assert str(tr["ts_recv"].dtype) == "datetime64[ns, UTC]"
+        assert set(tr["symbol"]) == {"NG.v.0"}
+        assert set(tr["instrument_id"]) == {101, 102}   # switch preserved
+        assert set(tr["side"]) == {"A", "B", "N"}       # N kept, not guessed
+        assert tr["ts_event"].is_monotonic_increasing   # file order by header start
+        assert abs(tr["price"].iloc[0] - 3.0) < 1e-12   # float dollars, unscaled
+        ohlcv = pd.read_parquet(f"{out}/NG/ohlcv1m.parquet")
+        assert "ts_event" in ohlcv.columns and len(ohlcv) == 3
+        defs = pd.read_parquet(f"{out}/NG/definitions.parquet")
+        assert set(defs["raw_symbol"]) == {"NGZ3", "NGF4"}
+        assert str(defs["expiration"].dtype) == "datetime64[ns, UTC]"
+
+
+def test_names_are_ignored_metadata_decides():
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        full_ng_tree(raw)   # a file is literally named CL_december
+        _expect_error(lambda: ingest("CL", raw, out, log=_quiet), "roots found: ['NG']")
+        m = ingest("NG", raw, out, log=_quiet)
+        srcs = [s["path"] for s in m["outputs"]["trades"]["source_files"]]
+        assert any("CL_december" in s for s in srcs), srcs
+        # The misleadingly named 'trades_NG' file holds bars, so it lands in ohlcv1m.
+        srcs = [s["path"] for s in m["outputs"]["ohlcv1m"]["source_files"]]
+        assert any("trades_NG" in s for s in srcs), srcs
+
+
+def test_manifest_records_actual_record_range_not_the_name():
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        full_ng_tree(raw)
+        ingest("NG", raw, out, log=_quiet)
+        with open(f"{out}/NG/ingest_manifest.json") as fh:
+            m = json.load(fh)
+        first = m["outputs"]["trades"]["source_files"][0]
+        assert first["metadata_start"].startswith("2023-11-30"), first
+        assert first["ts_event_min"].startswith("2023-11-30"), first
+        assert first["rows"] == 4 and len(first["sha256"]) == 64
+
+
+def test_undefined_stat_quantity_becomes_missing_not_a_number():
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        full_ng_tree(raw)
+        ingest("NG", raw, out, log=_quiet)
+        st = pd.read_parquet(f"{out}/NG/statistics.parquet")
+        q = st.set_index("stat_type")["quantity"]
+        assert pd.isna(q.loc[3]), q          # settlement: no quantity
+        assert q.loc[9] == 12345, q          # open interest
+        assert pd.isna(st.set_index("stat_type")["price"].loc[9])
+
+
+def test_identical_copy_is_skipped_and_recorded():
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        p = trades_file(f"{raw}/a/x.dbn.zst", "NG.v.0", 1, "2024-01-01", "2024-02-01")
+        os.makedirs(f"{raw}/b")
+        with open(p, "rb") as src, open(f"{raw}/b/copy.dbn.zst", "wb") as dst:
+            dst.write(src.read())
+        m = ingest("NG", raw, out, log=_quiet)
+        assert m["outputs"]["trades"]["rows"] == 3
+        assert len(m["outputs"]["trades"]["duplicates_skipped"]) == 1
+
+
+def test_overlapping_different_files_fail_loudly():
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        trades_file(f"{raw}/a.dbn.zst", "NG.v.0", 1, "2024-01-01", "2024-02-01")
+        trades_file(f"{raw}/b.dbn.zst", "NG.v.0", 1, "2024-01-15", "2024-03-01", n=2)
+        _expect_error(lambda: ingest("NG", raw, out, log=_quiet), "Overlapping")
+        assert not os.path.exists(f"{out}/NG/trades.parquet")
+
+
+def test_mixed_roll_conventions_fail_loudly():
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        trades_file(f"{raw}/a.dbn.zst", "NG.v.0", 1, "2024-01-01", "2024-02-01")
+        trades_file(f"{raw}/b.dbn.zst", "NG.c.0", 1, "2024-02-01", "2024-03-01")
+        _expect_error(lambda: ingest("NG", raw, out, log=_quiet), "different series")
+
+
+def test_mixed_datasets_fail_loudly():
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        trades_file(f"{raw}/a.dbn.zst", "NG.v.0", 1, "2024-01-01", "2024-02-01")
+        p = f"{raw}/b.dbn.zst"
+        write_dbn(p, dbn.Schema.TRADES, ["NG.v.0"], "2024-02-01", "2024-03-01", [],
+                  [_mapping("NG.v.0", 1, "2024-02-01", "2024-03-01")], dataset="IFEU.IMPACT")
+        _expect_error(lambda: ingest("NG", raw, out, log=_quiet), "different datasets")
+
+
+def test_coverage_gap_is_recorded_not_filled():
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        trades_file(f"{raw}/a.dbn.zst", "NG.v.0", 1, "2024-01-01", "2024-02-01")
+        trades_file(f"{raw}/b.dbn.zst", "NG.v.0", 1, "2024-03-01", "2024-04-01")
+        m = ingest("NG", raw, out, log=_quiet)
+        gaps = m["outputs"]["trades"]["coverage_gaps"]
+        assert len(gaps) == 1 and gaps[0]["from"].startswith("2024-02-01"), gaps
+        assert m["outputs"]["trades"]["rows"] == 6
+
+
+def test_record_overlap_across_files_is_flagged_for_cleaning():
+    # Feb file's first trade happened at 23:59:59.9 on 31 Jan but was received
+    # after midnight — it belongs to February's file yet sits before January's
+    # last trade in event time. Legitimate, but cleaning must know.
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        trades_file(f"{raw}/a.dbn.zst", "NG.v.0", 1, "2024-01-01", "2024-02-01",
+                    n=1, first_ts="2024-01-31T23:59:59.95")
+        trades_file(f"{raw}/b.dbn.zst", "NG.v.0", 1, "2024-02-01", "2024-03-01",
+                    n=1, first_ts="2024-01-31T23:59:59.90", recv_delay_ns=200_000_000)
+        m = ingest("NG", raw, out, log=_quiet)
+        assert len(m["outputs"]["trades"]["record_time_overlaps"]) == 1
+
+
+def test_row_outside_the_files_own_mappings_fails_loudly():
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        trades_file(f"{raw}/a.dbn.zst", "NG.v.0", 1, "2024-02-01", "2024-03-01",
+                    first_ts="2024-01-15")
+        _expect_error(lambda: ingest("NG", raw, out, log=_quiet), "no symbol mapping")
+        assert not os.path.exists(f"{out}/NG/trades.parquet")
+
+
+def test_file_with_several_roots_keeps_only_requested_rows():
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        recs = [dbn.TradeMsg(publisher_id=1, instrument_id=iid,
+                             ts_event=_ns("2024-01-02") + i * NS, price=3 * NS, size=1,
+                             action=dbn.Action.TRADE, side=dbn.Side.BID, depth=0,
+                             ts_recv=_ns("2024-01-02") + i * NS, flags=0, sequence=i)
+                for i, iid in enumerate((1, 2, 1, 2, 2))]
+        write_dbn(f"{raw}/combo.dbn.zst", dbn.Schema.TRADES, ["NG.v.0", "HG.v.0"],
+                  "2024-01-01", "2024-02-01", recs,
+                  [_mapping("NG.v.0", 1, "2024-01-01", "2024-02-01"),
+                   _mapping("HG.v.0", 2, "2024-01-01", "2024-02-01")])
+        ingest("NG", raw, out, log=_quiet)
+        ingest("HG", raw, out, log=_quiet)
+        ng = pd.read_parquet(f"{out}/NG/trades.parquet")
+        hg = pd.read_parquet(f"{out}/HG/trades.parquet")
+        assert len(ng) == 2 and set(ng["symbol"]) == {"NG.v.0"}
+        assert len(hg) == 3 and set(hg["symbol"]) == {"HG.v.0"}
+
+
+def test_existing_output_is_not_overwritten_without_force():
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        trades_file(f"{raw}/a.dbn.zst", "NG.v.0", 1, "2024-01-01", "2024-02-01")
+        ingest("NG", raw, out, log=_quiet)
+        _expect_error(lambda: ingest("NG", raw, out, log=_quiet), "--force")
+        ingest("NG", raw, out, force=True, log=_quiet)
+
+
+def test_failure_part_way_leaves_previous_outputs_untouched():
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        full_ng_tree(raw)
+        ingest("NG", raw, out, log=_quiet)
+        before = pd.read_parquet(f"{out}/NG/definitions.parquet")
+        # A new trades month whose rows fall outside its own mappings: the
+        # run must fail, and definitions (written first, alphabetically) must
+        # not be replaced by a half-finished run.
+        trades_file(f"{raw}/late.dbn.zst", "NG.v.0", 102, "2024-02-01", "2024-03-01",
+                    first_ts="2024-01-15")
+        _expect_error(lambda: ingest("NG", raw, out, force=True, log=_quiet),
+                      "no symbol mapping")
+        pd.testing.assert_frame_equal(before, pd.read_parquet(f"{out}/NG/definitions.parquet"))
+        leftovers = [n for n in os.listdir(f"{out}/NG") if n.endswith(".partial")]
+        assert not leftovers, leftovers
+
+
+def test_chunked_decoding_gives_identical_output():
+    with tempfile.TemporaryDirectory() as d:
+        raw = f"{d}/raw"
+        full_ng_tree(raw)
+        ingest("NG", raw, f"{d}/one", log=_quiet)
+        ingest("NG", raw, f"{d}/many", chunk_rows=2, log=_quiet)
+        for kind in ("trades", "statistics", "definitions"):
+            a = pd.read_parquet(f"{d}/one/NG/{kind}.parquet")
+            b = pd.read_parquet(f"{d}/many/NG/{kind}.parquet")
+            pd.testing.assert_frame_equal(a, b)
+
+
+def test_dry_run_writes_nothing():
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        full_ng_tree(raw)
+        m = ingest("NG", raw, out, dry_run=True, log=_quiet)
+        assert set(m["outputs"]) == {"trades", "ohlcv1m", "definitions", "statistics"}
+        assert not os.path.exists(f"{out}/NG")
+
+
+def test_unreadable_file_fails_loudly():
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        trades_file(f"{raw}/a.dbn.zst", "NG.v.0", 1, "2024-01-01", "2024-02-01")
+        with open(f"{raw}/broken.dbn.zst", "wb") as fh:
+            fh.write(b"not a dbn file")
+        _expect_error(lambda: ingest("NG", raw, out, log=_quiet), "could not read")
+
+
+def test_verify_output_rejects_missing_column_and_missing_ids():
+    with tempfile.TemporaryDirectory() as d:
+        ts = pd.to_datetime(["2024-01-02"], utc=True).as_unit("ns")
+        good = dict(ts_event=ts, ts_recv=ts, price=[1.0], size=[1], side=["A"],
+                    instrument_id=[1], symbol=["NG.v.0"], sequence=[0])
+        pd.DataFrame({k: v for k, v in good.items() if k != "side"}).to_parquet(f"{d}/a.parquet")
+        _expect_error(lambda: verify_output(f"{d}/a.parquet", "trades"), "missing required")
+        bad = dict(good, instrument_id=pd.array([None], dtype="Int64"))
+        pd.DataFrame(bad).to_parquet(f"{d}/b.parquet")
+        _expect_error(lambda: verify_output(f"{d}/b.parquet", "trades"), "missing values")
+        naive = dict(good, ts_event=pd.to_datetime(["2024-01-02"]))
+        pd.DataFrame(naive).to_parquet(f"{d}/c.parquet")
+        _expect_error(lambda: verify_output(f"{d}/c.parquet", "trades"), "UTC")
+        pd.DataFrame(good).to_parquet(f"{d}/ok.parquet")
+        assert verify_output(f"{d}/ok.parquet", "trades")
+
+
+if __name__ == "__main__":
+    print("ingest tests\n")
+    for _name, _fn in sorted(globals().items()):
+        if _name.startswith("test_") and callable(_fn):
+            check(_name, _fn)
+    print()
+    if _failures:
+        print(f"{len(_failures)} FAILED: {', '.join(_failures)}")
+        sys.exit(1)
+    print("all tests passed")

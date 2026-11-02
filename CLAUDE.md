@@ -85,6 +85,7 @@ Tests:
 ```bash
 .venv/bin/python test_feature_alignment.py   # 21 tests, no market data
 .venv/bin/python test_results_io.py          #  8 tests, no market data
+.venv/bin/python test_ingest.py              # 19 tests, synthetic DBN files, no market data
 .venv/bin/python validate_pipeline.py        # falsification suite, ~25 min
 ```
 
@@ -114,6 +115,8 @@ above after a run.
   align features by row number.
 - `validate_pipeline.py` — falsification suite (noise / shuffled-time /
   shuffled-target controls across seeds)
+- `ingest.py` — raw Databento `.dbn.zst` downloads → `data/<SYM>/*.parquet`,
+  identifying each file from its own header; see `docs/ingestion_format.md`
 - `results_io.py` — results-file discovery that refuses to hand a
   falsification control run to a reporting tool
 - `HANDOFF.md` — state of play and the multi-asset project brief
