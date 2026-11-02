@@ -56,10 +56,13 @@ def _mapping(sym, iid, start, end):
 
 
 def write_dbn(path, schema, symbols, start, end, records, mappings,
-              stype=dbn.SType.CONTINUOUS, dataset="GLBX.MDP3"):
+              stype=dbn.SType.CONTINUOUS, dataset="GLBX.MDP3", version=None,
+              not_found=None):
+    kw = {} if version is None else {"version": version}
     md = dbn.Metadata(dataset=dataset, start=_ns(start), end=_ns(end),
                       stype_in=stype, stype_out=dbn.SType.INSTRUMENT_ID,
-                      schema=schema, symbols=list(symbols), mappings=mappings)
+                      schema=schema, symbols=list(symbols), mappings=mappings,
+                      not_found=not_found, **kw)
     buf = io.BytesIO()
     buf.write(md.encode())
     for r in records:
@@ -334,6 +337,91 @@ def test_failure_part_way_leaves_previous_outputs_untouched():
         pd.testing.assert_frame_equal(before, pd.read_parquet(f"{out}/NG/definitions.parquet"))
         leftovers = [n for n in os.listdir(f"{out}/NG") if n.endswith(".partial")]
         assert not leftovers, leftovers
+
+
+def test_truncated_download_fails_loudly():
+    # An interrupted download: the records stop part-way through one.
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        for name in ("a.dbn", "b.dbn.zst"):
+            p = trades_file(f"{d}/full.dbn", "NG.v.0", 1, "2024-01-01", "2024-02-01", n=500)
+            with open(p, "rb") as fh:
+                data = fh.read()[:-20]
+            if name.endswith(".zst"):
+                data = zstandard.ZstdCompressor().compress(data)
+            os.makedirs(raw, exist_ok=True)
+            with open(f"{raw}/{name}", "wb") as fh:
+                fh.write(data)
+            _expect_error(lambda: ingest("NG", raw, out, log=_quiet), "truncated")
+            os.remove(f"{raw}/{name}")
+
+
+def test_old_dbn_version_is_upgraded_and_its_sentinel_becomes_missing():
+    # A statistics download from before DBN v3 stores "no quantity" as the
+    # 32-bit INT32_MAX. It must come out missing, just like a v3 file's.
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        for ver, cls, start, end, undef in (
+                (1, dbn.v1.StatMsg, "2024-01-01", "2024-02-01", 2**31 - 1),
+                (3, dbn.StatMsg, "2024-02-01", "2024-03-01", dbn.UNDEF_STAT_QUANTITY)):
+            t = _ns(start) + NS
+            recs = [cls(publisher_id=1, instrument_id=101, ts_event=t, ts_recv=t, ts_ref=t,
+                        price=3 * NS, quantity=undef,
+                        stat_type=dbn.StatType.SETTLEMENT_PRICE),
+                    cls(publisher_id=1, instrument_id=101, ts_event=t, ts_recv=t, ts_ref=t,
+                        price=dbn.UNDEF_PRICE, quantity=777,
+                        stat_type=dbn.StatType.OPEN_INTEREST)]
+            write_dbn(f"{raw}/v{ver}.dbn", dbn.Schema.STATISTICS, ["NG.FUT"], start, end,
+                      recs, [_mapping("NGH4", 101, start, end)],
+                      stype=dbn.SType.PARENT, version=ver)
+        m = ingest("NG", raw, out, log=_quiet)
+        st = pd.read_parquet(f"{out}/NG/statistics.parquet")
+        assert len(st) == 4
+        settle = st[st["stat_type"] == 3]["quantity"]
+        assert settle.isna().all(), settle.tolist()
+        assert st[st["stat_type"] == 9]["quantity"].tolist() == [777, 777]
+        versions = [s["dbn_version"] for s in m["outputs"]["statistics"]["source_files"]]
+        assert versions == [1, 3], versions
+
+
+def test_shared_file_with_unassignable_spread_fails_rather_than_dropping():
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        t = _ns("2024-01-02")
+        recs = [dbn.TradeMsg(publisher_id=1, instrument_id=iid, ts_event=t + i * NS,
+                             price=3 * NS, size=1, action=dbn.Action.TRADE,
+                             side=dbn.Side.BID, depth=0, ts_recv=t + i * NS, flags=0,
+                             sequence=i)
+                for i, iid in enumerate((1, 3, 2))]
+        write_dbn(f"{raw}/p.dbn", dbn.Schema.TRADES, ["NG.FUT", "HG.FUT"],
+                  "2024-01-01", "2024-02-01", recs,
+                  [_mapping("NGH4", 1, "2024-01-01", "2024-02-01"),
+                   _mapping("HGH4", 2, "2024-01-01", "2024-02-01"),
+                   _mapping("NGH4-HGJ4", 3, "2024-01-01", "2024-02-01")],
+                  stype=dbn.SType.PARENT)
+        _expect_error(lambda: ingest("NG", raw, out, log=_quiet), "no single root")
+
+
+def test_stale_output_from_earlier_run_is_refused_not_deleted():
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        full_ng_tree(raw)
+        ingest("NG", raw, out, log=_quiet)
+        import shutil
+        shutil.rmtree(f"{raw}/stats")
+        _expect_error(lambda: ingest("NG", raw, out, force=True, log=_quiet),
+                      "from an earlier run")
+        assert os.path.exists(f"{out}/NG/statistics.parquet")
+
+
+def test_symbols_databento_did_not_find_do_not_claim_a_file():
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        write_dbn(f"{raw}/a.dbn", dbn.Schema.TRADES, ["NG.v.0", "HG.v.0"],
+                  "2024-01-01", "2024-02-01", [],
+                  [_mapping("NG.v.0", 1, "2024-01-01", "2024-02-01")],
+                  not_found=["HG.v.0"])
+        _expect_error(lambda: ingest("HG", raw, out, log=_quiet), "roots found: ['NG']")
 
 
 def test_chunked_decoding_gives_identical_output():

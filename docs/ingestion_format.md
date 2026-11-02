@@ -37,6 +37,10 @@ reader crude's files came from — with two representational changes:
 2. In statistics, Databento's "undefined quantity" sentinel (INT64_MAX) is
    a real missing value (`Int64` NA). Prices are already NaN when undefined.
 
+Files in older DBN versions (v1/v2) are upgraded to v3 before decoding, so
+every output has one column layout whatever year it was downloaded in, and
+the old 32-bit "undefined" sentinels can't survive as numbers.
+
 Prices are float, in contract units, not scaled. Native Databento dtypes are
 kept (`instrument_id` is `uint32`, `size` is `uint32`).
 
@@ -56,13 +60,24 @@ cleaning report can count anything that would not survive the cast.
   series for the root (`NG.v.0` mixed with `NG.c.0`).
 - A row's `instrument_id` has no mapping in its file's own metadata on
   that date — it cannot be attributed to a contract.
-- A file's header cannot be read, or two files decode to incompatible
-  column layouts.
+- A file's header cannot be read, a file is truncated (an interrupted
+  download — Databento itself only warns), or two files decode to
+  incompatible column layouts.
+- A file bundling several roots has rows for a symbol with no single root
+  (a user-defined or inter-commodity spread). Dropping them would make the
+  output depend on how the download was bundled; pull that root on its own.
+- `data/<SYM>/` holds a parquet from an earlier run that this run would not
+  rewrite. It is not deleted; move it yourself.
 - A written file fails `verify_output` (no rows, missing required column,
   non-UTC timestamp, missing `instrument_id` / `symbol` / `ts_event`).
 
 All outputs are staged as `.partial` and only renamed into place once every
-one of them has passed, so a failed run leaves the previous outputs intact.
+one of them has passed, manifest last, so a failed run leaves the previous
+outputs intact.
+
+Options are filed under their own root: CL's options (`LO.OPT`) go to
+`data/LO/`, not `data/CL/`. Linking a future to its options root is a
+per-contract setting for piece C.
 
 ## Things B should look at in the manifest
 

@@ -47,6 +47,8 @@ import json
 import os
 import re
 import sys
+import tempfile
+import warnings
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -93,6 +95,9 @@ _RE_PARENT = re.compile(r"^([A-Z0-9]+)\.(?:FUT|OPT)$")
 _RE_OUTRIGHT = re.compile(rf"^([A-Z0-9]+?)[{_MONTH_CODES}]\d{{1,2}}$")
 
 _CHUNK_ROWS = 2_000_000
+# Definitions rows are ~70 columns with many strings; decode them in smaller
+# chunks so a whole-range parent pull doesn't need several GB at once.
+_CHUNK_ROWS_BY_SCHEMA = {"definition": 200_000}
 
 
 class IngestError(RuntimeError):
@@ -134,7 +139,7 @@ def _ns_to_iso(ns: Optional[int]) -> Optional[str]:
 @dataclass
 class RawFile:
     path: str
-    sha256: str
+    sha256: Optional[str]                # filled only for files that are used
     n_bytes: int
     dataset: str
     schema: str
@@ -144,6 +149,7 @@ class RawFile:
     end_ns: Optional[int]
     roots: Tuple[str, ...]                 # contract roots the header names
     unidentified_symbols: Tuple[str, ...]  # header symbols with no root
+    dbn_version: int = 3
 
     @property
     def kind(self) -> str:
@@ -154,6 +160,7 @@ class RawFile:
             "path": os.path.relpath(self.path, raw_dir),
             "sha256": self.sha256,
             "bytes": self.n_bytes,
+            "dbn_version": self.dbn_version,
             "dataset": self.dataset,
             "schema": self.schema,
             "stype_in": self.stype_in,
@@ -180,7 +187,10 @@ def read_header(path: str) -> RawFile:
     import databento as db
 
     md = db.DBNStore.from_file(path).metadata
-    symbols = tuple(str(s) for s in (md.symbols or ()))
+    # Symbols Databento reported as not found carry no data; don't let them
+    # make a file look like it belongs to a root.
+    not_found = {str(s) for s in (md.not_found or ())}
+    symbols = tuple(str(s) for s in (md.symbols or ()) if str(s) not in not_found)
     candidates = list(symbols)
     # A whole-venue pull says ALL_SYMBOLS; an instrument-id pull lists bare
     # numbers. In both cases the mappings carry the real symbols.
@@ -188,7 +198,10 @@ def read_header(path: str) -> RawFile:
         candidates = []
         for key, intervals in (md.mappings or {}).items():
             candidates.append(key)
-            candidates.extend(iv["symbol"] for iv in intervals)
+            # Mapping values are instrument ids for most pulls; keep only
+            # the ones that are symbols.
+            candidates.extend(iv["symbol"] for iv in intervals
+                              if not str(iv["symbol"]).isdigit())
     roots, unknown = set(), []
     for s in candidates:
         r = root_of(s)
@@ -199,7 +212,7 @@ def read_header(path: str) -> RawFile:
     end = md.end
     return RawFile(
         path=os.path.abspath(path),
-        sha256=_sha256(path),
+        sha256=None,
         n_bytes=os.path.getsize(path),
         dataset=str(md.dataset),
         schema=_enum_str(md.schema),
@@ -209,6 +222,7 @@ def read_header(path: str) -> RawFile:
         end_ns=None if end is None else int(end),
         roots=tuple(sorted(roots)),
         unidentified_symbols=tuple(sorted(set(unknown)))[:20],
+        dbn_version=int(md.version),
     )
 
 
@@ -253,6 +267,10 @@ def plan_outputs(files: Sequence[RawFile], symbol: str) -> Dict[str, OutputPlan]
 
     for plan in plans.values():
         # 1. Byte-identical copies of the same download: keep the first.
+        #    Hashing is done here, only for files this run will use.
+        for f in plan.files:
+            if f.sha256 is None:
+                f.sha256 = _sha256(f.path)
         seen: Dict[str, RawFile] = {}
         unique = []
         for f in sorted(plan.files, key=lambda x: (x.start_ns, x.path)):
@@ -299,7 +317,7 @@ def _series_for(f: RawFile, symbol: str) -> Tuple[str, ...]:
     don't count). Outright contracts collapse to the root, so pulling NGZ3
     in one month and NGF4 in the next is still one series."""
     own = [s for s in f.symbols if root_of(s) == symbol]
-    if f.stype_in == "raw_symbol":
+    if f.stype_in == "raw_symbol" and "ALL_SYMBOLS" not in f.symbols:
         return (f"{symbol} outrights",)
     return tuple(sorted(own)) or (f"{symbol} via mappings",)
 
@@ -310,10 +328,34 @@ def _list_paths(files: Iterable[RawFile]) -> str:
 
 # ── Decoding and writing ─────────────────────────────────────────────────────
 
-def _frames(f: RawFile, symbol: str, chunk_rows: int) -> Iterable[pd.DataFrame]:
+def _upgrade_to_v3(src: str, dest: str) -> None:
+    """Rewrite a DBN v1/v2 file as v3. ``DBNStore.to_df`` decodes with the
+    file's own version, so without this an older download comes out with a
+    different column layout (definitions) or a 32-bit "undefined" sentinel
+    that survives as the number 2147483647 (statistics)."""
+    import databento as db
+    import databento_dbn as dbn
+
+    store = db.DBNStore.from_file(src)
+    md3 = dbn.Metadata.decode(store.metadata.encode(),
+                              upgrade_policy=dbn.VersionUpgradePolicy.UPGRADE_TO_V3)
+    with open(dest, "wb") as out:
+        out.write(md3.encode())
+        for rec in store:                      # DBNStore iteration upgrades to v3
+            out.write(bytes(rec))
+
+
+def _frames(f: RawFile, symbol: str, chunk_rows: int,
+            scratch_dir: str) -> Iterable[pd.DataFrame]:
     import databento as db
 
-    store = db.DBNStore.from_file(f.path)
+    path = f.path
+    if f.dbn_version < 3:
+        path = os.path.join(scratch_dir, f"{f.sha256}.v3.dbn")
+        _upgrade_to_v3(f.path, path)
+    store = db.DBNStore.from_file(path)
+    if int(store.metadata.version) != 3:
+        raise IngestError(f"{f.path}: could not bring DBN v{f.dbn_version} up to v3")
     shared = f.roots != (symbol,)
     for df in store.to_df(price_type="float", pretty_ts=True, map_symbols=True,
                           count=chunk_rows):
@@ -331,9 +373,20 @@ def _frames(f: RawFile, symbol: str, chunk_rows: int) -> Iterable[pd.DataFrame]:
                 f"ts_event={first.get('ts_event')}), so they cannot be attributed "
                 "to a contract.")
         if shared:
-            # A file with several roots: keep only rows for this one.
-            roots = df["symbol"].map(root_of)
-            df = df[roots == symbol]
+            # A file with several roots: keep only rows for this one. A row
+            # whose symbol has no recognisable root (a user-defined or
+            # inter-commodity spread) cannot be assigned, and dropping it
+            # silently would make the output depend on how the download was
+            # bundled — stop instead.
+            uniq = pd.unique(df["symbol"])
+            root_map = {u: root_of(u) for u in uniq}
+            orphans = [u for u, r in root_map.items() if r is None]
+            if orphans:
+                raise IngestError(
+                    f"{f.path} holds several roots {list(f.roots)} and rows for "
+                    f"symbols with no single root {orphans[:5]}; they cannot be "
+                    "assigned to one contract. Download this root separately.")
+            df = df[df["symbol"].map(root_map) == symbol]
         if f.kind == "statistics" and "quantity" in df.columns:
             q = df["quantity"]
             df = df.assign(quantity=q.astype("Int64").mask(q == _UNDEF_STAT_QUANTITY))
@@ -348,34 +401,47 @@ def _frame_stats(df: pd.DataFrame) -> Tuple[int, Optional[pd.Timestamp], Optiona
 
 
 def write_output(plan: OutputPlan, tmp: str, symbol: str,
-                 chunk_rows: int = _CHUNK_ROWS) -> List[dict]:
+                 chunk_rows: Optional[int] = None) -> List[dict]:
     """Stream every file of one output into a single parquet at ``tmp``, in
     header-start order. Removes ``tmp`` if anything fails part-way."""
+    from databento.common.error import BentoWarning
+
+    if chunk_rows is None:
+        chunk_rows = _CHUNK_ROWS_BY_SCHEMA.get(plan.schema, _CHUNK_ROWS)
     writer: Optional[pq.ParquetWriter] = None
     schema: Optional[pa.Schema] = None
     per_file = []
+    scratch = tempfile.TemporaryDirectory(prefix=".ingest-", dir=os.path.dirname(tmp))
     try:
         for f in plan.files:
             n, t0, t1 = 0, None, None
-            for df in _frames(f, symbol, chunk_rows):
-                table = pa.Table.from_pandas(df, preserve_index=False)
-                if schema is None:
-                    schema = table.schema
-                    writer = pq.ParquetWriter(tmp, schema)
-                elif not table.schema.equals(schema, check_metadata=False):
-                    try:
-                        table = table.cast(schema)
-                    except (pa.ArrowInvalid, pa.ArrowNotImplementedError, ValueError) as e:
-                        raise IngestError(
-                            f"{plan.kind}: {f.path} has a different column "
-                            f"layout from the files before it:\n  {table.schema}\n"
-                            f"vs\n  {schema}") from e
-                if table.num_rows:
-                    writer.write_table(table)
-                k, a, b = _frame_stats(df)
-                n += k
-                t0 = a if t0 is None or (a is not None and a < t0) else t0
-                t1 = b if t1 is None or (b is not None and b > t1) else t1
+            # Databento only *warns* when a file is cut short; an interrupted
+            # download would otherwise be ingested as if it were complete.
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", BentoWarning)
+                try:
+                    for df in _frames(f, symbol, chunk_rows, scratch.name):
+                        table = pa.Table.from_pandas(df, preserve_index=False)
+                        if schema is None:
+                            schema = table.schema
+                            writer = pq.ParquetWriter(tmp, schema)
+                        elif not table.schema.equals(schema, check_metadata=False):
+                            try:
+                                table = table.cast(schema)
+                            except (pa.ArrowInvalid, pa.ArrowNotImplementedError,
+                                    ValueError) as e:
+                                raise IngestError(
+                                    f"{plan.kind}: {f.path} has a different column "
+                                    f"layout from the files before it:\n  {table.schema}"
+                                    f"\nvs\n  {schema}") from e
+                        if table.num_rows:
+                            writer.write_table(table)
+                        k, lo, hi = _frame_stats(df)
+                        n += k
+                        t0 = lo if t0 is None or (lo is not None and lo < t0) else t0
+                        t1 = hi if t1 is None or (hi is not None and hi > t1) else t1
+                except BentoWarning as w:
+                    raise IngestError(f"{f.path}: {w} — re-download it") from w
             per_file.append({"path": f.path, "rows": n,
                              "ts_event_min": None if t0 is None else t0.isoformat(),
                              "ts_event_max": None if t1 is None else t1.isoformat()})
@@ -389,6 +455,8 @@ def write_output(plan: OutputPlan, tmp: str, symbol: str,
         if os.path.exists(tmp):
             os.remove(tmp)
         raise
+    finally:
+        scratch.cleanup()
     return per_file
 
 
@@ -448,7 +516,7 @@ def verify_output(path: str, kind: str, expected_rows: Optional[int] = None) -> 
 # ── Driver ───────────────────────────────────────────────────────────────────
 
 def ingest(symbol: str, raw_dir: str, out_dir: str, force: bool = False,
-           dry_run: bool = False, chunk_rows: int = _CHUNK_ROWS,
+           dry_run: bool = False, chunk_rows: Optional[int] = None,
            log=print) -> dict:
     symbol = symbol.upper()
     raw_dir = os.path.abspath(raw_dir)
@@ -497,10 +565,20 @@ def ingest(symbol: str, raw_dir: str, out_dir: str, force: bool = False,
         exists = [p for p in targets.values() if os.path.exists(p)]
         if exists:
             raise IngestError(f"already exist: {exists}; pass --force to replace them")
+    if not dry_run and os.path.isdir(out_sym):
+        # An earlier run's output that this run would not rewrite would sit
+        # next to a manifest that no longer mentions it. Don't delete data —
+        # make the person decide.
+        stale = sorted(n for n in os.listdir(out_sym) if n.endswith(".parquet")
+                       and os.path.join(out_sym, n) not in targets.values())
+        if stale:
+            raise IngestError(
+                f"{out_sym} holds {stale} from an earlier run, but no raw file in "
+                f"{raw_dir} produces them now. Move or delete them, then re-run.")
 
     # Every output is written to <name>.partial and verified; only when all of
-    # them pass are they renamed into place, together, followed by the
-    # manifest. A failure part-way leaves the previous outputs untouched.
+    # them pass are they renamed into place, followed by the manifest. A
+    # failure while decoding or checking leaves the previous outputs untouched.
     staged: Dict[str, str] = {}
     try:
         for kind, plan in sorted(plans.items()):
@@ -541,11 +619,17 @@ def ingest(symbol: str, raw_dir: str, out_dir: str, force: bool = False,
             log(f"  decoded {rows:,} rows; checks passed")
 
         if not dry_run:
-            for kind, tmp in staged.items():
-                os.replace(tmp, targets[kind])
-            staged.clear()
-            with open(os.path.join(out_sym, "ingest_manifest.json"), "w") as fh:
+            man_path = os.path.join(out_sym, "ingest_manifest.json")
+            staged["__manifest__"] = man_path + ".partial"
+            with open(staged["__manifest__"], "w") as fh:
                 json.dump(manifest, fh, indent=2)
+            # Renames are atomic one by one, not as a set; the manifest goes
+            # last, so it never describes outputs that are not yet in place.
+            for kind, tmp in staged.items():
+                if kind != "__manifest__":
+                    os.replace(tmp, targets[kind])
+            os.replace(staged["__manifest__"], man_path)
+            staged.clear()
             log(f"\nwrote {len(targets)} output(s) and ingest_manifest.json to {out_sym}")
     finally:
         for tmp in staged.values():
