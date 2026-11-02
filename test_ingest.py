@@ -9,7 +9,6 @@ folder names in the fixtures are deliberately misleading: the ingester must
 go by what the header says.
 """
 
-import datetime as dt
 import io
 import json
 import os
@@ -18,7 +17,6 @@ import tempfile
 from types import SimpleNamespace as _NS
 
 import pandas as pd
-import pyarrow.parquet as pq
 
 try:
     import databento_dbn as dbn
