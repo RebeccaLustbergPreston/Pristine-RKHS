@@ -424,6 +424,34 @@ def test_symbols_databento_did_not_find_do_not_claim_a_file():
         _expect_error(lambda: ingest("HG", raw, out, log=_quiet), "roots found: ['NG']")
 
 
+def test_misleading_name_is_flagged_but_header_still_decides():
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        trades_file(f"{raw}/CL_jan.dbn.zst", "NG.v.0", 1, "2024-01-01", "2024-02-01")
+        trades_file(f"{raw}/crude/x.dbn.zst", "CL.v.0", 2, "2024-01-01", "2024-02-01")
+        trades_file(f"{raw}/NG_feb.dbn.zst", "NG.v.0", 1, "2024-02-01", "2024-03-01")
+        m = ingest("NG", raw, out, log=_quiet)
+        assert m["outputs"]["trades"]["rows"] == 6
+        mm = m["name_mismatches"]
+        assert [x["path"] for x in mm] == ["CL_jan.dbn.zst"], mm
+        assert mm[0]["name_says"] == ["CL"] and mm[0]["header_says"] == ["NG"]
+
+
+def test_list_reports_every_file_and_writes_nothing():
+    from ingest import list_raw
+    with tempfile.TemporaryDirectory() as d:
+        raw = f"{d}/raw"
+        full_ng_tree(raw)
+        trades_file(f"{raw}/other/x.dbn.zst", "CL.v.0", 9, "2024-01-01", "2024-02-01")
+        lines = []
+        files = list_raw(raw, log=lines.append)
+        assert len(files) == 6
+        text = "\n".join(lines)
+        assert "CL" in text and "statistics" in text and "ohlcv-1m" in text
+        assert "CL_december" in text and "WARNING" in text   # misleading name
+        assert os.listdir(d) == ["raw"]
+
+
 def test_chunked_decoding_gives_identical_output():
     with tempfile.TemporaryDirectory() as d:
         raw = f"{d}/raw"

@@ -8,15 +8,25 @@ contract. This note is the contract between ingestion (A) and cleaning (B)
 python ingest.py --symbol NG                       # reads data/raw/, writes data/NG/
 python ingest.py --symbol NG --raw-dir ~/dl --dry-run   # what would happen, writes nothing
 python ingest.py --symbol NG --check               # re-verify data/NG/*.parquet
+python ingest.py --list --raw-dir ~/dl             # what every raw file holds, by header
 ```
+
+To try it on data that lives only on your machine (nothing is uploaded):
+`scripts/try_ingest.sh NG ~/path/to/downloads`. It sets up `.venv`, lists
+the files, does a dry run, ingests, and re-checks.
 
 ## Input
 
 Any folder tree of `*.dbn.zst` / `*.dbn` files (default `data/raw/`). How it
 is organised does not matter. Each file is identified **only from its DBN
 header**: dataset, schema, symbols, symbology and the instrument mappings.
-File and folder names are never read, so a file called `CL_december` that
-holds NG trades is ingested as NG trades.
+File and folder names never decide anything, so a file called
+`CL_december` that holds NG trades is ingested as NG trades. Names are
+cross-checked, though: if a file or folder name mentions a ticker that its
+header does not hold, the run prints a warning and lists it under
+`name_mismatches` in the manifest, so a mislabelled download gets noticed
+and renamed. Every output carries the ticker in its path (`data/NG/...`) and
+in the manifest.
 
 ## Output
 

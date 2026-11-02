@@ -235,6 +235,64 @@ def find_raw_files(raw_dir: str) -> List[str]:
     return sorted(out)
 
 
+def _read_headers(paths: Sequence[str]) -> Tuple[List[RawFile], List[dict]]:
+    files, unreadable = [], []
+    for p in paths:
+        try:
+            files.append(read_header(p))
+        except Exception as e:  # noqa: BLE001 — reported by the caller
+            unreadable.append({"path": p, "error": f"{type(e).__name__}: {e}"})
+    return files, unreadable
+
+
+def _name_tokens(path: str, raw_dir: str) -> set:
+    rel = os.path.relpath(path, raw_dir)
+    return {t.upper() for t in re.split(r"[^A-Za-z0-9]+", rel) if t}
+
+
+def name_mismatches(files: Sequence[RawFile], raw_dir: str) -> List[dict]:
+    """
+    Files whose name or folder mentions a ticker their header does not hold.
+
+    The header still decides what a file is — this only makes a misleading
+    name visible, so whoever organised the download can fix it. Only tickers
+    that some header in this folder actually contains count as tickers, so
+    words like "trades" or "dec" never trigger it.
+    """
+    known = {r for f in files for r in f.roots}
+    out = []
+    for f in files:
+        named = sorted(_name_tokens(f.path, raw_dir) & known)
+        if named and not set(named) & set(f.roots):
+            out.append({"path": os.path.relpath(f.path, raw_dir),
+                        "name_says": named, "header_says": list(f.roots)})
+    return out
+
+
+def list_raw(raw_dir: str, log=print) -> List[RawFile]:
+    """Print what every raw file holds, according to its header. Writes nothing."""
+    raw_dir = os.path.abspath(raw_dir)
+    paths = find_raw_files(raw_dir)
+    if not paths:
+        raise IngestError(f"no .dbn.zst / .dbn files under {raw_dir}")
+    files, unreadable = _read_headers(paths)
+    log(f"{len(paths)} raw file(s) under {raw_dir}\n")
+    log(f"{'ticker':<8}{'schema':<12}{'series':<16}{'start':<12}{'end':<12}"
+        f"{'dbn':<5}{'MB':>9}  file")
+    for f in sorted(files, key=lambda x: (x.roots, x.schema, x.start_ns)):
+        series = ",".join(f.symbols)[:15]
+        end = _ns_to_iso(f.end_ns)[:10] if f.end_ns is not None else "?"
+        log(f"{','.join(f.roots) or '??':<8}{f.schema:<12}{series:<16}"
+            f"{_ns_to_iso(f.start_ns)[:10]:<12}{end:<12}v{f.dbn_version:<4}"
+            f"{f.n_bytes / 1e6:>9.1f}  {os.path.relpath(f.path, raw_dir)}")
+    for u in unreadable:
+        log(f"{'UNREADABLE':<69}{os.path.relpath(u['path'], raw_dir)}  ({u['error']})")
+    for mm in name_mismatches(files, raw_dir):
+        log(f"\nWARNING: {mm['path']} is named for {mm['name_says']} but holds "
+            f"{mm['header_says']}")
+    return files
+
+
 # ── Grouping and the alignment checks ────────────────────────────────────────
 
 @dataclass
@@ -527,12 +585,7 @@ def ingest(symbol: str, raw_dir: str, out_dir: str, force: bool = False,
         raise IngestError(f"no .dbn.zst / .dbn files under {raw_dir}")
 
     log(f"Reading headers of {len(paths)} raw files under {raw_dir} ...")
-    files, unreadable = [], []
-    for p in paths:
-        try:
-            files.append(read_header(p))
-        except Exception as e:  # noqa: BLE001 — reported, then fatal below
-            unreadable.append({"path": p, "error": f"{type(e).__name__}: {e}"})
+    files, unreadable = _read_headers(paths)
     if unreadable:
         raise IngestError("could not read the DBN header of: "
                           + "; ".join(f"{u['path']} ({u['error']})" for u in unreadable))
@@ -542,6 +595,10 @@ def ingest(symbol: str, raw_dir: str, out_dir: str, force: bool = False,
         log(f"  WARNING: cannot tell which contract {f.path} holds "
             f"(symbols {list(f.unidentified_symbols or f.symbols)[:5]}); skipped")
     other_roots = sorted({r for f in files for r in f.roots} - {symbol})
+    mismatches = name_mismatches(files, raw_dir)
+    for mm in mismatches:
+        log(f"  WARNING: {mm['path']} is named for {mm['name_says']} but its "
+            f"header says {mm['header_says']}; going by the header")
 
     plans = plan_outputs(files, symbol)
     if not plans:
@@ -558,6 +615,7 @@ def ingest(symbol: str, raw_dir: str, out_dir: str, force: bool = False,
         "outputs": {},
         "files_for_other_roots": other_roots,
         "unidentified_files": [f.describe(raw_dir) for f in unidentified],
+        "name_mismatches": mismatches,
     }
 
     targets = {kind: os.path.join(out_sym, f"{kind}.parquet") for kind in plans}
@@ -670,7 +728,7 @@ def check_existing(symbol: str, out_dir: str, log=print) -> None:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--symbol", required=True, help="contract root, e.g. NG")
+    ap.add_argument("--symbol", help="contract root, e.g. NG")
     ap.add_argument("--raw-dir", default=os.path.join(_ROOT, "data", "raw"),
                     help="folder holding the Databento downloads (searched recursively)")
     ap.add_argument("--out-dir", default=os.path.join(_ROOT, "data"),
@@ -681,9 +739,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="identify and check the raw files, write nothing")
     ap.add_argument("--check", action="store_true",
                     help="only verify outputs already in <out-dir>/<SYMBOL>/")
+    ap.add_argument("--list", action="store_true",
+                    help="print what every raw file holds (any ticker); write nothing")
     args = ap.parse_args(argv)
+    if not args.list and not args.symbol:
+        ap.error("--symbol is required (or use --list)")
     try:
-        if args.check:
+        if args.list:
+            list_raw(args.raw_dir)
+        elif args.check:
             check_existing(args.symbol, args.out_dir)
         else:
             m = ingest(args.symbol, args.raw_dir, args.out_dir,
