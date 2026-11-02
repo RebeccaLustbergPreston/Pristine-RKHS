@@ -32,8 +32,9 @@ column, and Databento's "undefined quantity" sentinel in statistics becomes a
 real missing value instead of 9.2e18, so missing stays missing.
 
 It stops with an error, rather than guessing, when the inputs do not line up:
-two different files covering the same period, files for one output that come
-from different datasets or different series (``NG.v.0`` mixed with
+two different files that could hold the same records for the same period,
+a download that is truncated or fails its job manifest's hash, files for one
+output from different datasets or different series (``NG.v.0`` mixed with
 ``NG.c.0``), mismatched column layouts, or a written file that fails the
 checks in ``verify_output``.
 """
@@ -93,11 +94,18 @@ _MONTH_CODES = "FGHJKMNQUVXZ"
 _RE_CONTINUOUS = re.compile(r"^([A-Z0-9]+)\.[CNV]\.\d+$")
 _RE_PARENT = re.compile(r"^([A-Z0-9]+)\.(?:FUT|OPT)$")
 _RE_OUTRIGHT = re.compile(rf"^([A-Z0-9]+?)[{_MONTH_CODES}]\d{{1,2}}$")
+_RE_STRATEGY = re.compile(r"^([A-Z0-9]+):[A-Z0-9]{2}\s")
 
 _CHUNK_ROWS = 2_000_000
 # Definitions rows are ~70 columns with many strings; decode them in smaller
 # chunks so a whole-range parent pull doesn't need several GB at once.
-_CHUNK_ROWS_BY_SCHEMA = {"definition": 200_000}
+_CHUNK_ROWS_BY_SCHEMA = {"definition": 200_000, "mbp-10": 250_000, "mbo": 1_000_000}
+
+# Record layouts that changed between DBN v1/v2 and v3. Only these need to be
+# rewritten as v3 before decoding; for every other schema the bytes are the
+# same and an upgraded copy would only cost disk.
+_SCHEMAS_CHANGED_SINCE_V1 = {"definition", "statistics"}
+_SCRATCH_PREFIX = ".ingest-"
 
 
 class IngestError(RuntimeError):
@@ -113,12 +121,17 @@ def root_of(symbol: str) -> Optional[str]:
         NG.v.0 → NG      (continuous)       NG.FUT → NG   (parent)
         NGZ3   → NG      (outright)         NGZ3-NGF4 → NG (calendar spread)
         LOZ3 C4800 → LO  (option)           4242 → None   (instrument id)
+        NG:BF H4-J4-K4 → NG  (CME exchange-defined strategy)
+        UD:1V: VT 0102999 → None  (user-defined spread, may mix roots)
     """
     s = str(symbol).strip().upper()
     for rx in (_RE_CONTINUOUS, _RE_PARENT):
         m = rx.match(s)
         if m:
             return m.group(1)
+    m = _RE_STRATEGY.match(s)
+    if m and m.group(1) != "UD":
+        return m.group(1)
     s = s.split(" ")[0]                         # drop an option strike suffix
     legs = re.split(r"[-:]", s)
     roots = set()
@@ -150,6 +163,7 @@ class RawFile:
     roots: Tuple[str, ...]                 # contract roots the header names
     unidentified_symbols: Tuple[str, ...]  # header symbols with no root
     dbn_version: int = 3
+    instrument_ids: Tuple[int, ...] = ()   # from the header's symbol mappings
 
     @property
     def kind(self) -> str:
@@ -171,11 +185,62 @@ class RawFile:
 
 
 def _sha256(path: str) -> str:
+    """SHA-256 of the file, and — for .zst files — proof that every zstd frame
+    in it is complete. A download cut short at a compressed block boundary
+    decodes cleanly into fewer records, and Databento's reader does not notice
+    (python-zstandard returns the whole blocks it has), so check here."""
+    import zstandard
+
     h = hashlib.sha256()
+    is_zst = path.endswith(".zst")
+    dctx = zstandard.ZstdDecompressor()
+    obj, fed = dctx.decompressobj(), False
     with open(path, "rb") as f:
         for block in iter(lambda: f.read(1 << 20), b""):
             h.update(block)
+            while is_zst and block:
+                try:
+                    obj.decompress(block)
+                except zstandard.ZstdError as e:
+                    raise IngestError(f"{path}: corrupt zstd data ({e}) — re-download it") from e
+                fed = True
+                if obj.eof:                      # frame finished; more may follow
+                    block = obj.unused_data
+                    obj, fed = dctx.decompressobj(), False
+                else:
+                    block = b""
+    if is_zst and fed and not obj.eof:
+        raise IngestError(f"{path}: the zstd stream stops part-way through a frame — "
+                          "the download is truncated; re-download it")
     return h.hexdigest()
+
+
+def load_batch_manifests(raw_dir: str) -> Dict[str, dict]:
+    """
+    Databento batch jobs ship a ``manifest.json`` listing each file with its
+    sha256. Map every listed file (absolute path) to its job and expected hash.
+    Used to catch corrupt downloads and to recognise the parts of one job.
+    """
+    out: Dict[str, dict] = {}
+    for dirpath, dirnames, files in os.walk(raw_dir):
+        dirnames[:] = [d for d in dirnames if not d.startswith(_SCRATCH_PREFIX)]
+        if "manifest.json" not in files:
+            continue
+        mpath = os.path.join(dirpath, "manifest.json")
+        try:
+            with open(mpath) as fh:
+                entries = json.load(fh).get("files", [])
+        except (OSError, ValueError, AttributeError):
+            continue                       # not a Databento job manifest
+        for e in entries if isinstance(entries, list) else []:
+            name, digest = e.get("filename"), str(e.get("hash", ""))
+            if not name:
+                continue
+            out[os.path.abspath(os.path.join(dirpath, name))] = {
+                "job": mpath,
+                "sha256": digest.split(":", 1)[1] if digest.startswith("sha256:") else None,
+            }
+    return out
 
 
 def _enum_str(v) -> str:
@@ -187,6 +252,15 @@ def read_header(path: str) -> RawFile:
     import databento as db
 
     md = db.DBNStore.from_file(path).metadata
+    if md.schema is None:
+        raise IngestError("mixed-schema file (live recording); not supported")
+    if md.ts_out:
+        raise IngestError("file carries ts_out (live recording); not supported")
+    ids = set()
+    for intervals in (md.mappings or {}).values():
+        for iv in intervals:
+            if str(iv["symbol"]).isdigit():
+                ids.add(int(iv["symbol"]))
     # Symbols Databento reported as not found carry no data; don't let them
     # make a file look like it belongs to a root.
     not_found = {str(s) for s in (md.not_found or ())}
@@ -223,12 +297,15 @@ def read_header(path: str) -> RawFile:
         roots=tuple(sorted(roots)),
         unidentified_symbols=tuple(sorted(set(unknown)))[:20],
         dbn_version=int(md.version),
+        instrument_ids=tuple(sorted(ids)),
     )
 
 
 def find_raw_files(raw_dir: str) -> List[str]:
     out = []
-    for dirpath, _, files in os.walk(raw_dir):
+    for dirpath, dirnames, files in os.walk(raw_dir):
+        # Skip ingest's own scratch folders, in case --raw-dir covers data/.
+        dirnames[:] = [d for d in dirnames if not d.startswith(_SCRATCH_PREFIX)]
         for name in files:
             if name.endswith(".dbn.zst") or name.endswith(".dbn"):
                 out.append(os.path.join(dirpath, name))
@@ -240,6 +317,8 @@ def _read_headers(paths: Sequence[str]) -> Tuple[List[RawFile], List[dict]]:
     for p in paths:
         try:
             files.append(read_header(p))
+        except ImportError:
+            raise                          # a broken environment, not a bad file
         except Exception as e:  # noqa: BLE001 — reported by the caller
             unreadable.append({"path": p, "error": f"{type(e).__name__}: {e}"})
     return files, unreadable
@@ -304,14 +383,21 @@ class OutputPlan:
     coverage_gaps: List[dict] = field(default_factory=list)
 
 
-def plan_outputs(files: Sequence[RawFile], symbol: str) -> Dict[str, OutputPlan]:
+def plan_outputs(files: Sequence[RawFile], symbol: str,
+                 batch: Optional[Dict[str, dict]] = None) -> Dict[str, OutputPlan]:
     """
     Group the files for ``symbol`` by output and check that they line up.
 
     Raises IngestError when files for one output disagree on dataset, on the
     series pulled for this root, or cover overlapping periods with different
     contents. Byte-identical copies are skipped and recorded.
+
+    Two files may cover the same period when they cannot hold the same
+    records: their header mappings name disjoint instrument ids (a batch job
+    split by symbol, or one download per contract), or they are listed in the
+    same Databento job ``manifest.json`` (a job split by size).
     """
+    batch = batch or {}
     plans: Dict[str, OutputPlan] = {}
     for f in files:
         if symbol not in f.roots:
@@ -329,6 +415,12 @@ def plan_outputs(files: Sequence[RawFile], symbol: str) -> Dict[str, OutputPlan]
         for f in plan.files:
             if f.sha256 is None:
                 f.sha256 = _sha256(f.path)
+            want = batch.get(f.path, {}).get("sha256")
+            if want and want != f.sha256:
+                raise IngestError(
+                    f"{f.path}: sha256 {f.sha256[:12]}… does not match the "
+                    f"{want[:12]}… in its job's manifest.json — the download is "
+                    "incomplete or corrupt; re-download it")
         seen: Dict[str, RawFile] = {}
         unique = []
         for f in sorted(plan.files, key=lambda x: (x.start_ns, x.path)):
@@ -346,28 +438,52 @@ def plan_outputs(files: Sequence[RawFile], symbol: str) -> Dict[str, OutputPlan]
             raise IngestError(
                 f"{plan.kind}: files come from different datasets {sorted(datasets)}; "
                 + _list_paths(plan.files))
-        series = {(f.stype_in, _series_for(f, symbol)) for f in plan.files}
+        series = {(_stype_label(f), _series_for(f, symbol)) for f in plan.files}
         if len(series) > 1:
             raise IngestError(
                 f"{plan.kind}: files pull different series for {symbol} "
                 f"{sorted(series)} — e.g. a volume roll mixed with a calendar "
                 "roll. Pick one and remove the others; " + _list_paths(plan.files))
 
-        # 3. No two distinct files may cover the same period.
-        for a, b in zip(plan.files, plan.files[1:]):
-            a_end = a.end_ns if a.end_ns is not None else np.iinfo(np.int64).max
-            if b.start_ns < a_end:
+        # 3. No two files that could hold the same records may cover the
+        #    same period. Files are sorted by start, so compare each with every
+        #    earlier file still open at its start.
+        inf = np.iinfo(np.int64).max
+        for i, b in enumerate(plan.files):
+            for a in plan.files[:i]:
+                a_end = a.end_ns if a.end_ns is not None else inf
+                if b.start_ns >= a_end or _may_coexist(a, b, batch):
+                    continue
                 raise IngestError(
                     f"{plan.kind}: {a.path} covers {_ns_to_iso(a.start_ns)} → "
-                    f"{_ns_to_iso(a.end_ns)} and {b.path} starts at "
-                    f"{_ns_to_iso(b.start_ns)}. Overlapping downloads with "
-                    "different contents would duplicate or contradict records; "
-                    "remove one.")
-            if a.end_ns is not None and b.start_ns > a.end_ns:
+                    f"{_ns_to_iso(a.end_ns)} and {b.path} covers "
+                    f"{_ns_to_iso(b.start_ns)} → {_ns_to_iso(b.end_ns)}, for the "
+                    "same instruments. They would duplicate or contradict each "
+                    "other's records. If they are parts of one Databento batch job, "
+                    "put the job's manifest.json next to them; if one is a "
+                    "re-download, keep only one copy.")
+        # Gaps: periods no file covers, measured against the union so far.
+        covered_to = None
+        prev = None
+        for f in plan.files:
+            if covered_to is not None and f.start_ns > covered_to:
                 plan.coverage_gaps.append(
-                    {"from": _ns_to_iso(a.end_ns), "to": _ns_to_iso(b.start_ns),
-                     "after": a.path, "before": b.path})
+                    {"from": _ns_to_iso(covered_to), "to": _ns_to_iso(f.start_ns),
+                     "after": prev.path, "before": f.path})
+            f_end = f.end_ns if f.end_ns is not None else inf
+            if covered_to is None or f_end > covered_to:
+                covered_to, prev = f_end, f
     return plans
+
+
+def _may_coexist(a: RawFile, b: RawFile, batch: Dict[str, dict]) -> bool:
+    """Can two files covering the same period both be kept?"""
+    ja, jb = batch.get(a.path, {}).get("job"), batch.get(b.path, {}).get("job")
+    if ja is not None and ja == jb:
+        return True                         # size-split parts of one job
+    if a.instrument_ids and b.instrument_ids:
+        return not set(a.instrument_ids) & set(b.instrument_ids)
+    return False
 
 
 def _series_for(f: RawFile, symbol: str) -> Tuple[str, ...]:
@@ -378,6 +494,18 @@ def _series_for(f: RawFile, symbol: str) -> Tuple[str, ...]:
     if f.stype_in == "raw_symbol" and "ALL_SYMBOLS" not in f.symbols:
         return (f"{symbol} outrights",)
     return tuple(sorted(own)) or (f"{symbol} via mappings",)
+
+
+def _stype_label(f: RawFile) -> str:
+    """Old DBN v1 files say ``smart`` for what is now ``continuous`` or
+    ``parent``; read it off the symbols so the same series compares equal."""
+    if f.stype_in != "smart":
+        return f.stype_in
+    if any(_RE_CONTINUOUS.match(s.upper()) for s in f.symbols):
+        return "continuous"
+    if any(_RE_PARENT.match(s.upper()) for s in f.symbols):
+        return "parent"
+    return "smart"
 
 
 def _list_paths(files: Iterable[RawFile]) -> str:
@@ -408,11 +536,12 @@ def _frames(f: RawFile, symbol: str, chunk_rows: int,
     import databento as db
 
     path = f.path
-    if f.dbn_version < 3:
-        path = os.path.join(scratch_dir, f"{f.sha256}.v3.dbn")
+    upgraded = None
+    if f.dbn_version < 3 and f.schema in _SCHEMAS_CHANGED_SINCE_V1:
+        upgraded = path = os.path.join(scratch_dir, f"{f.sha256}.v3.dbn")
         _upgrade_to_v3(f.path, path)
     store = db.DBNStore.from_file(path)
-    if int(store.metadata.version) != 3:
+    if upgraded and int(store.metadata.version) != 3:
         raise IngestError(f"{f.path}: could not bring DBN v{f.dbn_version} up to v3")
     shared = f.roots != (symbol,)
     for df in store.to_df(price_type="float", pretty_ts=True, map_symbols=True,
@@ -449,6 +578,8 @@ def _frames(f: RawFile, symbol: str, chunk_rows: int,
             q = df["quantity"]
             df = df.assign(quantity=q.astype("Int64").mask(q == _UNDEF_STAT_QUANTITY))
         yield df.reset_index(drop=True)
+    if upgraded:
+        os.remove(upgraded)                 # free the disk before the next file
 
 
 def _frame_stats(df: pd.DataFrame) -> Tuple[int, Optional[pd.Timestamp], Optional[pd.Timestamp]]:
@@ -469,7 +600,7 @@ def write_output(plan: OutputPlan, tmp: str, symbol: str,
     writer: Optional[pq.ParquetWriter] = None
     schema: Optional[pa.Schema] = None
     per_file = []
-    scratch = tempfile.TemporaryDirectory(prefix=".ingest-", dir=os.path.dirname(tmp))
+    scratch = tempfile.TemporaryDirectory(prefix=_SCRATCH_PREFIX, dir=os.path.dirname(tmp))
     try:
         for f in plan.files:
             n, t0, t1 = 0, None, None
@@ -479,6 +610,8 @@ def write_output(plan: OutputPlan, tmp: str, symbol: str,
                 warnings.simplefilter("error", BentoWarning)
                 try:
                     for df in _frames(f, symbol, chunk_rows, scratch.name):
+                        if len(df) == 0:
+                            continue        # an empty chunk must not fix the schema
                         table = pa.Table.from_pandas(df, preserve_index=False)
                         if schema is None:
                             schema = table.schema
@@ -500,6 +633,9 @@ def write_output(plan: OutputPlan, tmp: str, symbol: str,
                         t1 = hi if t1 is None or (hi is not None and hi > t1) else t1
                 except BentoWarning as w:
                     raise IngestError(f"{f.path}: {w} — re-download it") from w
+                except EOFError as e:   # Python 3.14's zstd reader on a cut stream
+                    raise IngestError(f"{f.path}: compressed stream ends early "
+                                      f"({e}) — re-download it") from e
             per_file.append({"path": f.path, "rows": n,
                              "ts_event_min": None if t0 is None else t0.isoformat(),
                              "ts_event_max": None if t1 is None else t1.isoformat()})
@@ -525,8 +661,9 @@ def verify_output(path: str, kind: str, expected_rows: Optional[int] = None) -> 
     Structural checks on one written output. Returns a list of the checks
     that passed; raises IngestError on the first one that fails.
 
-    These are the properties crude's files have and that every loader and
-    cleaning step relies on: the file opens, has rows, carries the required
+    These are the properties every loader and cleaning step relies on, and
+    that crude's files are expected to have (not yet confirmed against the
+    real crude parquets): the file opens, has rows, carries the required
     columns, every timestamp column is UTC at nanosecond precision, and
     ``instrument_id`` / ``symbol`` are never missing (they are how contract
     switches are found).
@@ -600,7 +737,8 @@ def ingest(symbol: str, raw_dir: str, out_dir: str, force: bool = False,
         log(f"  WARNING: {mm['path']} is named for {mm['name_says']} but its "
             f"header says {mm['header_says']}; going by the header")
 
-    plans = plan_outputs(files, symbol)
+    batch = load_batch_manifests(raw_dir)
+    plans = plan_outputs(files, symbol, batch=batch)
     if not plans:
         found = sorted({r for f in files for r in f.roots})
         raise IngestError(f"no raw file's metadata names root {symbol}; "
@@ -619,11 +757,12 @@ def ingest(symbol: str, raw_dir: str, out_dir: str, force: bool = False,
     }
 
     targets = {kind: os.path.join(out_sym, f"{kind}.parquet") for kind in plans}
-    if not dry_run and not force:
+    # A dry run applies the same checks, so it predicts the real run.
+    if not force:
         exists = [p for p in targets.values() if os.path.exists(p)]
         if exists:
-            raise IngestError(f"already exist: {exists}; pass --force to replace them")
-    if not dry_run and os.path.isdir(out_sym):
+            raise IngestError(f"already exist: {exists}; pass --force (FORCE=1 with scripts/try_ingest.sh) to replace them")
+    if os.path.isdir(out_sym):
         # An earlier run's output that this run would not rewrite would sit
         # next to a manifest that no longer mentions it. Don't delete data —
         # make the person decide.
@@ -652,7 +791,11 @@ def ingest(symbol: str, raw_dir: str, out_dir: str, force: bool = False,
                 "dataset": plan.files[0].dataset,
                 "stype_in": plan.files[0].stype_in,
                 "series": list(_series_for(plan.files[0], symbol)),
-                "source_files": [f.describe(raw_dir) for f in plan.files],
+                "source_files": [
+                    {**f.describe(raw_dir),
+                     "batch_job": (os.path.relpath(batch[f.path]["job"], raw_dir)
+                                   if f.path in batch else None)}
+                    for f in plan.files],
                 "duplicates_skipped": [
                     {k: os.path.relpath(v, raw_dir) for k, v in d.items()}
                     for d in plan.duplicates_skipped],
@@ -746,16 +889,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ap.error("--symbol is required (or use --list)")
     try:
         if args.list:
-            list_raw(args.raw_dir)
+            files = list_raw(args.raw_dir)
+            n_bad = len(find_raw_files(os.path.abspath(args.raw_dir))) - len(files)
+            if n_bad:
+                raise IngestError(f"{n_bad} raw file(s) could not be read (see above)")
         elif args.check:
             check_existing(args.symbol, args.out_dir)
         else:
-            m = ingest(args.symbol, args.raw_dir, args.out_dir,
-                       force=args.force, dry_run=args.dry_run)
             if args.dry_run:
-                print("\n" + json.dumps(m, indent=2))
+                # Progress goes to stderr so stdout is the plan, as clean JSON.
+                m = ingest(args.symbol, args.raw_dir, args.out_dir, force=args.force,
+                           dry_run=True, log=lambda *a: print(*a, file=sys.stderr))
+                print(json.dumps(m, indent=2))
+                return 0
+            ingest(args.symbol, args.raw_dir, args.out_dir, force=args.force)
     except IngestError as e:
         print(f"\nINGEST FAILED: {e}", file=sys.stderr)
+        return 1
+    except ImportError as e:
+        print(f"\nINGEST FAILED: {e}. Install the requirements: "
+              "pip install -r requirements.txt", file=sys.stderr)
         return 1
     print("\ndone")
     return 0

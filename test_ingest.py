@@ -17,13 +17,16 @@ import tempfile
 from types import SimpleNamespace as _NS
 
 import pandas as pd
+import pyarrow.parquet as pq
 
 try:
     import databento_dbn as dbn
     import zstandard
 except ImportError:
-    print("SKIP: test_ingest needs the `databento` package (pip install -r requirements.txt)")
-    sys.exit(0)
+    # Fail, don't skip: a silently skipped suite is how test_pipeline.py
+    # stopped running without anyone noticing.
+    print("FAIL: test_ingest needs the `databento` package (pip install -r requirements.txt)")
+    sys.exit(1)
 
 from ingest import IngestError, ingest, root_of, verify_output
 
@@ -234,7 +237,7 @@ def test_overlapping_different_files_fail_loudly():
         raw, out = f"{d}/raw", f"{d}/data"
         trades_file(f"{raw}/a.dbn.zst", "NG.v.0", 1, "2024-01-01", "2024-02-01")
         trades_file(f"{raw}/b.dbn.zst", "NG.v.0", 1, "2024-01-15", "2024-03-01", n=2)
-        _expect_error(lambda: ingest("NG", raw, out, log=_quiet), "Overlapping")
+        _expect_error(lambda: ingest("NG", raw, out, log=_quiet), "same instruments")
         assert not os.path.exists(f"{out}/NG/trades.parquet")
 
 
@@ -460,6 +463,8 @@ def test_chunked_decoding_gives_identical_output():
             a = pd.read_parquet(f"{d}/one/NG/{kind}.parquet")
             b = pd.read_parquet(f"{d}/many/NG/{kind}.parquet")
             pd.testing.assert_frame_equal(a, b)
+        # Each chunk is its own row group, so this proves chunking happened.
+        assert pq.ParquetFile(f"{d}/many/NG/trades.parquet").num_row_groups > 1
 
 
 def test_dry_run_writes_nothing():
@@ -493,8 +498,163 @@ def test_verify_output_rejects_missing_column_and_missing_ids():
         naive = dict(good, ts_event=pd.to_datetime(["2024-01-02"]))
         pd.DataFrame(naive).to_parquet(f"{d}/c.parquet")
         _expect_error(lambda: verify_output(f"{d}/c.parquet", "trades"), "UTC")
+        chicago = dict(good, ts_event=ts.tz_convert("America/Chicago"))
+        pd.DataFrame(chicago).to_parquet(f"{d}/tz.parquet")
+        _expect_error(lambda: verify_output(f"{d}/tz.parquet", "trades"), "UTC")
+        nosym = dict(good, symbol=pd.array([None], dtype="str"))
+        pd.DataFrame(nosym).to_parquet(f"{d}/s.parquet")
+        _expect_error(lambda: verify_output(f"{d}/s.parquet", "trades"), "missing values")
+        nots = dict(good, ts_event=pd.to_datetime([None], utc=True).as_unit("ns"))
+        pd.DataFrame(nots).to_parquet(f"{d}/t.parquet")
+        _expect_error(lambda: verify_output(f"{d}/t.parquet", "trades"), "no ts_event")
         pd.DataFrame(good).to_parquet(f"{d}/ok.parquet")
         assert verify_output(f"{d}/ok.parquet", "trades")
+        _expect_error(lambda: verify_output(f"{d}/ok.parquet", "trades", expected_rows=2),
+                      "decoded")
+
+
+def _trade(iid, ts, seq=0):
+    return dbn.TradeMsg(publisher_id=1, instrument_id=iid, ts_event=ts, price=3 * NS,
+                        size=1, action=dbn.Action.TRADE, side=dbn.Side.BID, depth=0,
+                        ts_recv=ts, flags=0, sequence=seq)
+
+
+def test_files_are_ordered_by_header_start_not_by_name():
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        trades_file(f"{raw}/a_later.dbn.zst", "NG.v.0", 1, "2024-02-01", "2024-03-01")
+        trades_file(f"{raw}/z_earlier.dbn.zst", "NG.v.0", 1, "2024-01-01", "2024-02-01")
+        ingest("NG", raw, out, log=_quiet)
+        tr = pd.read_parquet(f"{out}/NG/trades.parquet")
+        assert tr["ts_event"].is_monotonic_increasing, tr["ts_event"].tolist()
+
+
+def test_rows_are_not_sorted_within_a_file():
+    # Sorting is cleaning rule d — B must see the raw order to assert on it.
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        t = _ns("2024-01-02")
+        recs = [_trade(1, t + k * NS, seq=i) for i, k in enumerate((3, 1, 2))]
+        write_dbn(f"{raw}/a.dbn", dbn.Schema.TRADES, ["NG.v.0"], "2024-01-01",
+                  "2024-02-01", recs, [_mapping("NG.v.0", 1, "2024-01-01", "2024-02-01")])
+        ingest("NG", raw, out, log=_quiet)
+        tr = pd.read_parquet(f"{out}/NG/trades.parquet")
+        assert tr["sequence"].tolist() == [0, 1, 2]
+        assert not tr["ts_event"].is_monotonic_increasing
+
+
+def test_incompatible_column_layouts_fail_loudly():
+    from ingest import OutputPlan, write_output
+    import ingest as ing
+    with tempfile.TemporaryDirectory() as d:
+        raw = f"{d}/raw"
+        a = trades_file(f"{raw}/a.dbn", "NG.v.0", 1, "2024-01-01", "2024-02-01")
+        b = trades_file(f"{raw}/b.dbn", "NG.v.0", 1, "2024-02-01", "2024-03-01")
+        files = [ing.read_header(a), ing.read_header(b)]
+        for f in files:
+            f.sha256 = "x" + f.path[-6:]
+        real = ing._frames
+
+        def frames(f, *args):
+            for df in real(f, *args):
+                yield df.assign(price="not a price") if f.path == files[1].path else df
+        ing._frames = frames
+        try:
+            plan = OutputPlan(kind="trades", schema="trades", files=files)
+            _expect_error(lambda: write_output(plan, f"{d}/t.parquet.partial", "NG"),
+                          "different column layout")
+            assert not os.path.exists(f"{d}/t.parquet.partial")
+        finally:
+            ing._frames = real
+
+
+def test_batch_split_by_symbol_is_accepted():
+    # One parent pull, split per contract: same period, disjoint instruments.
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        t = _ns("2024-01-02")
+        for iid, sym in ((1, "NGG4"), (2, "NGH4")):
+            write_dbn(f"{raw}/job/{sym}.dbn", dbn.Schema.TRADES, ["NG.FUT"],
+                      "2024-01-01", "2024-02-01", [_trade(iid, t + iid * NS)],
+                      [_mapping(sym, iid, "2024-01-01", "2024-02-01")],
+                      stype=dbn.SType.PARENT)
+        m = ingest("NG", raw, out, log=_quiet)
+        assert m["outputs"]["trades"]["rows"] == 2
+        assert m["outputs"]["trades"]["coverage_gaps"] == []
+
+
+def _write_job_manifest(folder, names):
+    import hashlib
+    files = []
+    for n in names:
+        with open(f"{folder}/{n}", "rb") as fh:
+            files.append({"filename": n, "hash": "sha256:" + hashlib.sha256(fh.read()).hexdigest()})
+    with open(f"{folder}/manifest.json", "w") as fh:
+        json.dump({"files": files}, fh)
+
+
+def test_batch_split_by_size_needs_the_jobs_manifest():
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        t = _ns("2024-01-02")
+        for part, k in (("p1", 0), ("p2", 5)):
+            write_dbn(f"{raw}/job/{part}.dbn", dbn.Schema.TRADES, ["NG.v.0"],
+                      "2024-01-01", "2024-02-01", [_trade(1, t + k * NS, seq=k)],
+                      [_mapping("NG.v.0", 1, "2024-01-01", "2024-02-01")])
+        _expect_error(lambda: ingest("NG", raw, out, log=_quiet), "manifest.json")
+        _write_job_manifest(f"{raw}/job", ["p1.dbn", "p2.dbn"])
+        m = ingest("NG", raw, out, log=_quiet)
+        assert m["outputs"]["trades"]["rows"] == 2
+        assert all(s["batch_job"] for s in m["outputs"]["trades"]["source_files"])
+
+
+def test_hash_mismatch_with_job_manifest_fails_loudly():
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        trades_file(f"{raw}/job/a.dbn", "NG.v.0", 1, "2024-01-01", "2024-02-01")
+        _write_job_manifest(f"{raw}/job", ["a.dbn"])
+        trades_file(f"{raw}/job/a.dbn", "NG.v.0", 1, "2024-01-01", "2024-02-01", n=2)
+        _expect_error(lambda: ingest("NG", raw, out, log=_quiet), "does not match")
+
+
+def test_zstd_stream_cut_short_fails_loudly():
+    # Cut the *compressed* bytes, as an interrupted download does. Whether
+    # or not the cut lands mid-record, the unfinished zstd frame must be caught.
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        p = trades_file(f"{d}/full.dbn.zst", "NG.v.0", 1, "2024-01-01", "2024-02-01", n=3000)
+        with open(p, "rb") as fh:
+            data = fh.read()
+        os.makedirs(raw)
+        for cut in (len(data) // 2, len(data) - 3):
+            with open(f"{raw}/a.dbn.zst", "wb") as fh:
+                fh.write(data[:cut])
+            from ingest import _sha256
+            _expect_error(lambda: _sha256(f"{raw}/a.dbn.zst"), "re-download")
+            try:
+                ingest("NG", raw, out, log=_quiet)
+            except IngestError:
+                continue
+            raise AssertionError(f"cut at {cut}/{len(data)} was ingested")
+
+
+def test_strategy_symbols_and_smart_stype():
+    assert root_of("NG:BF H4-J4-K4") == "NG"
+    assert root_of("NG:C1 F4-G4") == "NG"
+    assert root_of("UD:1V: VT 0102999") is None
+    from ingest import RawFile, _stype_label
+    f = RawFile(path="x", sha256=None, n_bytes=0, dataset="GLBX.MDP3", schema="trades",
+                stype_in="smart", symbols=("NG.v.0",), start_ns=0, end_ns=1,
+                roots=("NG",), unidentified_symbols=())
+    assert _stype_label(f) == "continuous"
+
+
+def test_dry_run_predicts_the_refusal_of_the_real_run():
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        full_ng_tree(raw)
+        ingest("NG", raw, out, log=_quiet)
+        _expect_error(lambda: ingest("NG", raw, out, dry_run=True, log=_quiet), "--force")
 
 
 if __name__ == "__main__":

@@ -12,8 +12,21 @@ python ingest.py --list --raw-dir ~/dl             # what every raw file holds, 
 ```
 
 To try it on data that lives only on your machine (nothing is uploaded):
-`scripts/try_ingest.sh NG ~/path/to/downloads`. It sets up `.venv`, lists
-the files, does a dry run, ingests, and re-checks.
+`scripts/try_ingest.sh NG ~/path/to/downloads` (macOS/Linux, Python 3.11+).
+It sets up `.venv` with just what ingestion needs, lists the files, does a
+dry run (plan saved to `data/ingest_plan_NG.json`), ingests, and re-checks.
+`FORCE=1` replaces an earlier run's output.
+
+On Windows (PowerShell), the same steps by hand:
+
+```powershell
+py -3.13 -m venv .venv
+.venv\Scripts\python -m pip install databento==0.89.0 databento-dbn==0.70.0 zstandard==0.25.0 pandas==3.0.1 pyarrow==23.0.1 numpy==2.4.3
+.venv\Scripts\python ingest.py --list --raw-dir C:\path\to\downloads
+.venv\Scripts\python ingest.py --symbol NG --raw-dir C:\path\to\downloads --dry-run
+.venv\Scripts\python ingest.py --symbol NG --raw-dir C:\path\to\downloads
+.venv\Scripts\python ingest.py --symbol NG --check
+```
 
 ## Input
 
@@ -25,7 +38,9 @@ File and folder names never decide anything, so a file called
 cross-checked, though: if a file or folder name mentions a ticker that its
 header does not hold, the run prints a warning and lists it under
 `name_mismatches` in the manifest, so a mislabelled download gets noticed
-and renamed. Every output carries the ticker in its path (`data/NG/...`) and
+and renamed. A name only counts as a ticker if some header in the same
+folder holds that ticker, so `CL_december` is flagged when crude is also in
+the folder, and words like `trades` or `dec` never are. Every output carries the ticker in its path (`data/NG/...`) and
 in the manifest.
 
 ## Output
@@ -47,16 +62,26 @@ reader crude's files came from — with two representational changes:
 2. In statistics, Databento's "undefined quantity" sentinel (INT64_MAX) is
    a real missing value (`Int64` NA). Prices are already NaN when undefined.
 
-Files in older DBN versions (v1/v2) are upgraded to v3 before decoding, so
-every output has one column layout whatever year it was downloaded in, and
-the old 32-bit "undefined" sentinels can't survive as numbers.
+Definitions and statistics files in older DBN versions (v1/v2) are upgraded
+to v3 before decoding, so every output has one column layout whatever year
+it was downloaded in, and the old 32-bit "undefined" quantity can't survive
+as a number. (Other schemas' records did not change between versions.)
+
+Integer "undefined" values in **definitions** are kept as Databento writes
+them, e.g. `contract_multiplier = 2147483647`, `maturity_year = 65535`.
+Prices, `expiration` and other timestamps are already NaN/NaT when
+undefined. B should treat those integer maxima as missing.
 
 Prices are float, in contract units, not scaled. Native Databento dtypes are
 kept (`instrument_id` is `uint32`, `size` is `uint32`).
 
 ## What ingestion does *not* do — all of it is cleaning
 
-No row is dropped, sorted, de-duplicated, adjusted or filled. Rows appear in
+No row of the requested contract is dropped, sorted, de-duplicated,
+adjusted or filled. (A file bundling several contracts contributes only the
+requested contract's rows; a file whose header names no recognisable
+contract is skipped with a warning and listed under `unidentified_files`.)
+Rows appear in
 the order the files' headers start, and within a file in the order Databento
 wrote them. `session_date` is not added (rule f). Casting to the standard's
 dtypes (`instrument_id` → int32, `size` → float64) is left to B so the
@@ -64,20 +89,32 @@ cleaning report can count anything that would not survive the cast.
 
 ## When ingestion stops instead of guessing
 
-- Two *different* files for one output cover overlapping header periods
-  (byte-identical copies are skipped and recorded instead).
+- Two *different* files for one output cover overlapping header periods and
+  could hold the same records. Byte-identical copies are skipped and
+  recorded instead. Overlap is fine when the files' header mappings name
+  disjoint instruments (a batch job split by symbol, or one download per
+  contract), or when both are listed in the same Databento `manifest.json`
+  (a batch job split by size) — so keep each job's `manifest.json` with its
+  files.
+- A file's sha256 does not match the one in its job's `manifest.json`.
 - Files for one output come from different datasets, or pull different
   series for the root (`NG.v.0` mixed with `NG.c.0`).
 - A row's `instrument_id` has no mapping in its file's own metadata on
   that date — it cannot be attributed to a contract.
 - A file's header cannot be read, a file is truncated (an interrupted
-  download — Databento itself only warns), or two files decode to
-  incompatible column layouts.
+  download: the zstd stream stops mid-frame or the records stop mid-record —
+  Databento itself only warns), or two files decode to incompatible column
+  layouts. Live recordings (mixed schemas or `ts_out`) are refused.
 - A file bundling several roots has rows for a symbol with no single root
   (a user-defined or inter-commodity spread). Dropping them would make the
   output depend on how the download was bundled; pull that root on its own.
 - `data/<SYM>/` holds a parquet from an earlier run that this run would not
   rewrite. It is not deleted; move it yourself.
+- An output already exists and `--force` was not given.
+
+`--dry-run` applies all of the header-level checks above, including the
+existing-output ones, so a clean dry run predicts a clean real run up to
+decoding.
 - A written file fails `verify_output` (no rows, missing required column,
   non-UTC timestamp, missing `instrument_id` / `symbol` / `ts_event`).
 
@@ -101,6 +138,11 @@ per-contract setting for piece C.
 1. Does cleaning write back to `data/<SYM>/trades.parquet` in place, or to a
    separate path? In place is fine as long as the raw `.dbn.zst` files stay
    the source of truth — re-running ingestion restores the pre-clean file.
-2. `DataLoader.ohlcv()` currently expects `ts_event` as the *index*; the
-   standard (and this output) has it as a column. That is piece C's to
-   reconcile.
+2. `DataLoader` still reads crude's old names (`data/trades_CL_full.parquet`,
+   …), so `DataLoader(symbol="NG")` cannot see `data/NG/*` yet, and
+   `DataLoader.ohlcv()` expects `ts_event` as the *index* where the standard
+   (and this output) has a column. Both are piece C's to reconcile.
+3. Not yet shown on real data: that crude's own raw downloads ingest and
+   match `data/trades_CL_full.parquet` row for row, and that each file of a
+   real split batch job carries its own start/end in its header. Run
+   `python ingest.py --list` on one real job to confirm the latter.
