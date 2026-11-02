@@ -40,8 +40,8 @@ header does not hold, the run prints a warning and lists it under
 `name_mismatches` in the manifest, so a mislabelled download gets noticed
 and renamed. A name only counts as a ticker if some header in the same
 folder holds that ticker, so `CL_december` is flagged when crude is also in
-the folder, and words like `trades` or `dec` never are. Every output carries the ticker in its path (`data/NG/...`) and
-in the manifest.
+the folder, and words like `trades` or `dec` never are. Every output
+carries the ticker in its path (`data/NG/...`) and in the manifest.
 
 ## Output
 
@@ -81,8 +81,7 @@ No row of the requested contract is dropped, sorted, de-duplicated,
 adjusted or filled. (A file bundling several contracts contributes only the
 requested contract's rows; a file whose header names no recognisable
 contract is skipped with a warning and listed under `unidentified_files`.)
-Rows appear in
-the order the files' headers start, and within a file in the order Databento
+Rows appear in the order the files' headers start, and within a file in the order Databento
 wrote them. `session_date` is not added (rule f). Casting to the standard's
 dtypes (`instrument_id` → int32, `size` → float64) is left to B so the
 cleaning report can count anything that would not survive the cast.
@@ -111,12 +110,12 @@ cleaning report can count anything that would not survive the cast.
 - `data/<SYM>/` holds a parquet from an earlier run that this run would not
   rewrite. It is not deleted; move it yourself.
 - An output already exists and `--force` was not given.
-
-`--dry-run` applies all of the header-level checks above, including the
-existing-output ones, so a clean dry run predicts a clean real run up to
-decoding.
 - A written file fails `verify_output` (no rows, missing required column,
   non-UTC timestamp, missing `instrument_id` / `symbol` / `ts_event`).
+
+`--dry-run` applies all of the checks above that don't need decoding,
+including the existing-output ones, so a clean dry run predicts a clean
+real run up to decoding.
 
 All outputs are staged as `.partial` and only renamed into place once every
 one of them has passed, manifest last, so a failed run leaves the previous
