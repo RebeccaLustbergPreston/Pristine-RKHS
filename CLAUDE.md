@@ -85,7 +85,7 @@ Tests:
 ```bash
 .venv/bin/python test_feature_alignment.py   # 21 tests, no market data
 .venv/bin/python test_results_io.py          #  8 tests, no market data
-.venv/bin/python test_ingest.py              # 35 tests, synthetic DBN files, no market data
+.venv/bin/python test_ingest.py              # 39 tests, synthetic DBN files, no market data
 .venv/bin/python validate_pipeline.py        # falsification suite, ~25 min
 ```
 

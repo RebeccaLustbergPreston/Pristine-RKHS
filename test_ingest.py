@@ -608,6 +608,56 @@ def test_batch_split_by_size_needs_the_jobs_manifest():
         assert all(s["batch_job"] for s in m["outputs"]["trades"]["source_files"])
 
 
+def test_size_parts_keep_their_order_past_part_nine():
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        t = _ns("2024-01-02")
+        names = [f"part{i}.dbn" for i in range(12)]
+        for i, n in enumerate(names):
+            write_dbn(f"{raw}/job/{n}", dbn.Schema.TRADES, ["NG.v.0"],
+                      "2024-01-01", "2024-02-01", [_trade(1, t + i * NS, seq=i)],
+                      [_mapping("NG.v.0", 1, "2024-01-01", "2024-02-01")])
+        _write_job_manifest(f"{raw}/job", names)
+        ingest("NG", raw, out, log=_quiet)
+        tr = pd.read_parquet(f"{out}/NG/trades.parquet")
+        assert tr["sequence"].tolist() == list(range(12)), tr["sequence"].tolist()
+
+
+def test_foreign_manifest_json_is_ignored():
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        trades_file(f"{raw}/a.dbn", "NG.v.0", 1, "2024-01-01", "2024-02-01")
+        for i, body in enumerate(({"files": ["a", None]}, {"files": [{"filename": 123}]},
+                                  ["x"], "not json")):
+            os.makedirs(f"{raw}/other{i}")
+            with open(f"{raw}/other{i}/manifest.json", "w") as fh:
+                fh.write(body if isinstance(body, str) else json.dumps(body))
+        assert ingest("NG", raw, out, log=_quiet)["outputs"]["trades"]["rows"] == 3
+
+
+def test_compression_is_detected_by_content_not_extension():
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        trades_file(f"{raw}/plain_but_named.dbn.zst".replace(".zst", ""), "NG.v.0", 1,
+                    "2024-01-01", "2024-02-01")
+        os.rename(f"{raw}/plain_but_named.dbn", f"{raw}/plain_but_named.dbn.zst")
+        assert ingest("NG", raw, out, log=_quiet)["outputs"]["trades"]["rows"] == 3
+
+
+def test_upgraded_copies_are_cleaned_up():
+    with tempfile.TemporaryDirectory() as d:
+        raw, out = f"{d}/raw", f"{d}/data"
+        t = _ns("2024-01-01") + NS
+        rec = dbn.v1.StatMsg(publisher_id=1, instrument_id=101, ts_event=t, ts_recv=t,
+                             ts_ref=t, price=3 * NS, quantity=5,
+                             stat_type=dbn.StatType.SETTLEMENT_PRICE)
+        write_dbn(f"{raw}/v1.dbn", dbn.Schema.STATISTICS, ["NG.FUT"], "2024-01-01",
+                  "2024-02-01", [rec], [_mapping("NGH4", 101, "2024-01-01", "2024-02-01")],
+                  stype=dbn.SType.PARENT, version=1)
+        ingest("NG", raw, out, log=_quiet)
+        assert sorted(os.listdir(f"{out}/NG")) == ["ingest_manifest.json", "statistics.parquet"]
+
+
 def test_hash_mismatch_with_job_manifest_fails_loudly():
     with tempfile.TemporaryDirectory() as d:
         raw, out = f"{d}/raw", f"{d}/data"

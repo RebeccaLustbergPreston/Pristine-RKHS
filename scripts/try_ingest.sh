@@ -15,7 +15,7 @@ usage="usage: [FORCE=1] scripts/try_ingest.sh TICKER RAW_DIR"
 TICKER="${1:?$usage}"
 RAW_DIR="${2:?$usage}"
 [ -d "$RAW_DIR" ] || { echo "no such folder: $RAW_DIR" >&2; exit 1; }
-RAW_DIR="$(cd "$RAW_DIR" && pwd)"          # absolute, before we cd away
+RAW_DIR="$(CDPATH= cd -- "$RAW_DIR" && pwd)"          # absolute, before we cd away
 cd "$(dirname "$0")/.."
 
 FORCE_FLAG=""
@@ -34,7 +34,8 @@ if ! [ -x "$PY" ] || ! "$PY" -c 'import databento, pandas, pyarrow, zstandard' 2
   echo "== setting up .venv for ingest.py"
   [ -x "$PY" ] || "$PY_SYS" -m venv .venv
   # Only what ingest.py needs, at the versions pinned in requirements.txt.
-  pins=$(grep -E '^(databento|databento-dbn|zstandard|pandas|pyarrow|numpy)==' requirements.txt)
+  pins=$(grep -E '^(databento|databento-dbn|zstandard|pandas|pyarrow|numpy)==' requirements.txt) \
+    || { echo "could not find the pins in requirements.txt" >&2; exit 1; }
   # shellcheck disable=SC2086
   "$PY" -m pip install -q $pins
 fi
@@ -45,7 +46,8 @@ echo; echo "== 1/4 what is in $RAW_DIR (read from each file's header)"
 PLAN="data/ingest_plan_${TICKER}.json"
 mkdir -p data
 echo; echo "== 2/4 dry run for $TICKER (writes nothing but the plan)"
-"$PY" ingest.py --symbol "$TICKER" --raw-dir "$RAW_DIR" --dry-run $FORCE_FLAG > "$PLAN"
+"$PY" ingest.py --symbol "$TICKER" --raw-dir "$RAW_DIR" --dry-run $FORCE_FLAG > "$PLAN.tmp"
+mv "$PLAN.tmp" "$PLAN"
 echo "plan saved to $PLAN"
 
 echo; echo "== 3/4 ingest $TICKER → data/$TICKER/"

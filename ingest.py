@@ -192,23 +192,32 @@ def _sha256(path: str) -> str:
     import zstandard
 
     h = hashlib.sha256()
-    is_zst = path.endswith(".zst")
+    with open(path, "rb") as f:                 # by content, not by extension
+        magic = f.read(4)
+    is_zst = magic == b"\x28\xb5\x2f\xfd" or (                  # zstd frame
+        len(magic) == 4 and magic[1:] == b"\x2a\x4d\x18" and 0x50 <= magic[0] <= 0x5f)
     dctx = zstandard.ZstdDecompressor()
     obj, fed = dctx.decompressobj(), False
     with open(path, "rb") as f:
         for block in iter(lambda: f.read(1 << 20), b""):
             h.update(block)
-            while is_zst and block:
-                try:
-                    obj.decompress(block)
-                except zstandard.ZstdError as e:
-                    raise IngestError(f"{path}: corrupt zstd data ({e}) — re-download it") from e
-                fed = True
-                if obj.eof:                      # frame finished; more may follow
-                    block = obj.unused_data
-                    obj, fed = dctx.decompressobj(), False
-                else:
-                    block = b""
+            if not is_zst:
+                continue
+            # Feed small slices so a highly compressed block can't balloon memory.
+            for i in range(0, len(block), 64 << 10):
+                piece = block[i:i + (64 << 10)]
+                while piece:
+                    try:
+                        obj.decompress(piece)
+                    except zstandard.ZstdError as e:
+                        raise IngestError(
+                            f"{path}: corrupt zstd data ({e}) — re-download it") from e
+                    fed = True
+                    if obj.eof:                  # frame finished; more may follow
+                        piece = obj.unused_data
+                        obj, fed = dctx.decompressobj(), False
+                    else:
+                        piece = b""
     if is_zst and fed and not obj.eof:
         raise IngestError(f"{path}: the zstd stream stops part-way through a frame — "
                           "the download is truncated; re-download it")
@@ -232,13 +241,14 @@ def load_batch_manifests(raw_dir: str) -> Dict[str, dict]:
                 entries = json.load(fh).get("files", [])
         except (OSError, ValueError, AttributeError):
             continue                       # not a Databento job manifest
-        for e in entries if isinstance(entries, list) else []:
-            name, digest = e.get("filename"), str(e.get("hash", ""))
-            if not name:
-                continue
+        for pos, e in enumerate(entries if isinstance(entries, list) else []):
+            if not isinstance(e, dict) or not isinstance(e.get("filename"), str):
+                continue                   # not shaped like a Databento entry
+            name, digest = e["filename"], str(e.get("hash", ""))
             out[os.path.abspath(os.path.join(dirpath, name))] = {
                 "job": mpath,
                 "sha256": digest.split(":", 1)[1] if digest.startswith("sha256:") else None,
+                "position": pos,
             }
     return out
 
@@ -423,7 +433,10 @@ def plan_outputs(files: Sequence[RawFile], symbol: str,
                     "incomplete or corrupt; re-download it")
         seen: Dict[str, RawFile] = {}
         unique = []
-        for f in sorted(plan.files, key=lambda x: (x.start_ns, x.path)):
+        # Same start (size-split parts): the job manifest's order, then a
+        # natural sort so part 2 comes before part 10.
+        for f in sorted(plan.files, key=lambda x: (
+                x.start_ns, batch.get(x.path, {}).get("position", 0), _natural(x.path))):
             if f.sha256 in seen:
                 plan.duplicates_skipped.append(
                     {"path": f.path, "identical_to": seen[f.sha256].path})
@@ -474,6 +487,10 @@ def plan_outputs(files: Sequence[RawFile], symbol: str,
             if covered_to is None or f_end > covered_to:
                 covered_to, prev = f_end, f
     return plans
+
+
+def _natural(path: str) -> list:
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", path)]
 
 
 def _may_coexist(a: RawFile, b: RawFile, batch: Dict[str, dict]) -> bool:
@@ -579,6 +596,7 @@ def _frames(f: RawFile, symbol: str, chunk_rows: int,
             df = df.assign(quantity=q.astype("Int64").mask(q == _UNDEF_STAT_QUANTITY))
         yield df.reset_index(drop=True)
     if upgraded:
+        del store                           # release the handle (Windows can't delete open files)
         os.remove(upgraded)                 # free the disk before the next file
 
 
