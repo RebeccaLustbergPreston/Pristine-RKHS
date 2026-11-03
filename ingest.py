@@ -38,10 +38,11 @@ output from different datasets or different series (``NG.v.0`` mixed with
 ``NG.c.0``), mismatched column layouts, or a written file that fails the
 checks in ``verify_output``.
 
-Trades that arrived as a Databento CSV parent pull (NG and HG) are handled by
-``ingest_csv.py``: narrowed to the continuous series the contract's other
-files use, by Databento's own roll, and checked against its minute bars. A DBN
-trades download always takes precedence over a CSV one.
+Trades that are not one continuous DBN series — a parent pull (NG, HG as CSV;
+half of ES as DBN), or a CSV export of a continuous pull (CL, GC) — are handled
+by ``ingest_csv.py``: narrowed to the continuous series of the contract's minute
+bars by Databento's own roll, and checked against those bars. Continuous DBN
+trades of one series take the ordinary path and win over any CSV.
 """
 
 from __future__ import annotations
@@ -741,7 +742,7 @@ def verify_output(path: str, kind: str, expected_rows: Optional[int] = None) -> 
 
 def ingest(symbol: str, raw_dir: str, out_dir: str, force: bool = False,
            dry_run: bool = False, chunk_rows: Optional[int] = None,
-           log=print) -> dict:
+           log=print, skip_schemas: Sequence[str] = ()) -> dict:
     symbol = symbol.upper()
     raw_dir = os.path.abspath(raw_dir)
     if not os.path.isdir(raw_dir):
@@ -756,6 +757,10 @@ def ingest(symbol: str, raw_dir: str, out_dir: str, force: bool = False,
         raise IngestError("could not read the DBN header of: "
                           + "; ".join(f"{u['path']} ({u['error']})" for u in unreadable))
 
+    skipped = [f for f in files if f.schema in skip_schemas]
+    if skipped:
+        log(f"  skipping {len(skipped)} file(s) of schema {sorted(set(skip_schemas))}")
+        files = [f for f in files if f.schema not in skip_schemas]
     unidentified = [f for f in files if not f.roots]
     for f in unidentified:
         log(f"  WARNING: cannot tell which contract {f.path} holds "
@@ -767,10 +772,14 @@ def ingest(symbol: str, raw_dir: str, out_dir: str, force: bool = False,
             f"header says {mm['header_says']}; going by the header")
 
     batch = load_batch_manifests(raw_dir)
+    from ingest_csv import (check_against_bars, finish_plan, select_trades_sources,
+                            write_narrowed_trades)
+    files, narrowed, trades_not_used = select_trades_sources(files, raw_dir, symbol,
+                                                             log=log)
     plans = plan_outputs(files, symbol, batch=batch)
-    from ingest_csv import check_against_bars, plan_csv_trades, write_csv_trades
-    csv_plan, csv_not_used = plan_csv_trades(raw_dir, symbol, plans, batch, log=log)
-    if not plans and csv_plan is None:
+    if narrowed is not None:
+        narrowed = finish_plan(narrowed, plans, symbol, batch)
+    if not plans and narrowed is None:
         found = sorted({r for f in files for r in f.roots})
         raise IngestError(f"no raw file's metadata names root {symbol}; "
                           f"roots found: {found}")
@@ -785,12 +794,13 @@ def ingest(symbol: str, raw_dir: str, out_dir: str, force: bool = False,
         "files_for_other_roots": other_roots,
         "unidentified_files": [f.describe(raw_dir) for f in unidentified],
         "name_mismatches": mismatches,
-        "csv_jobs_not_used": csv_not_used,
+        "schemas_skipped": sorted(set(skip_schemas)),
+        "trades_sources_not_used": trades_not_used,
     }
 
     targets = {kind: os.path.join(out_sym, f"{kind}.parquet") for kind in plans}
-    if csv_plan is not None:
-        targets[csv_plan.kind] = os.path.join(out_sym, f"{csv_plan.kind}.parquet")
+    if narrowed is not None:
+        targets[narrowed.kind] = os.path.join(out_sym, f"{narrowed.kind}.parquet")
     # A dry run applies the same checks, so it predicts the real run.
     if not force:
         exists = [p for p in targets.values() if os.path.exists(p)]
@@ -853,21 +863,21 @@ def ingest(symbol: str, raw_dir: str, out_dir: str, force: bool = False,
             entry["checks_passed"] = verify_output(tmp, kind, expected_rows=rows)
             log(f"  decoded {rows:,} rows; checks passed")
 
-        if csv_plan is not None:
-            job, cal = csv_plan.job, csv_plan.calendar
+        if narrowed is not None:
+            cal = narrowed.calendar
             out_path = targets["trades"]
-            log(f"\ntrades: {len(job.files)} CSV file(s) of a {','.join(job.symbols)} "
-                f"pull, narrowed to {cal.series} by Databento's roll → {out_path}")
+            log(f"\ntrades: {len(narrowed.sources)} source(s) narrowed to {cal.series} "
+                f"by Databento's roll → {out_path}")
             entry = {
                 "path": os.path.relpath(out_path, os.path.abspath(out_dir)),
                 "schema": "trades",
-                "dataset": job.dataset,
+                "dataset": cal.dataset,
                 "stype_in": "continuous",
                 "series": [cal.series],
-                "converted_from_csv": {**job.describe(raw_dir),
-                                       "roll": cal.describe(raw_dir),
-                                       "rows_kept_if": "instrument_id is the one the "
-                                       "roll maps for the UTC date of ts_recv"},
+                "narrowed": {"sources": [x.describe(raw_dir) for x in narrowed.sources],
+                             "roll": cal.describe(raw_dir),
+                             "rows_kept_if": "instrument_id is the one the roll maps "
+                                             "for the UTC date of ts_recv"},
                 "source_files": [],
             }
             manifest["outputs"]["trades"] = entry
@@ -875,7 +885,8 @@ def ingest(symbol: str, raw_dir: str, out_dir: str, force: bool = False,
                 os.makedirs(out_sym, exist_ok=True)
                 tmp = out_path + ".partial"
                 staged["trades"] = tmp
-                per_file, counts = write_csv_trades(csv_plan, tmp, chunk_rows=chunk_rows)
+                per_file, counts = write_narrowed_trades(narrowed, tmp, symbol,
+                                                         chunk_rows=chunk_rows)
                 entry["source_files"] = [{**p, "path": os.path.relpath(p["path"], raw_dir)}
                                          for p in per_file]
                 _flag_record_overlaps(entry, log)
@@ -886,7 +897,7 @@ def ingest(symbol: str, raw_dir: str, out_dir: str, force: bool = False,
                     checks.append(check_against_bars(tmp, staged["ohlcv1m"], cal.series))
                 else:
                     log(f"  WARNING: no {symbol} minute bars in this run, so the "
-                        "converted trades were not checked against Databento's bars")
+                        "narrowed trades were not checked against Databento's bars")
                 entry["checks_passed"] = checks
                 log(f"  kept {entry['rows']:,} of {counts['rows_read']:,} rows; "
                     "checks passed")
@@ -954,6 +965,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="identify and check the raw files, write nothing")
     ap.add_argument("--check", action="store_true",
                     help="only verify outputs already in <out-dir>/<SYMBOL>/")
+    ap.add_argument("--skip-schema", action="append", default=[], metavar="SCHEMA",
+                    help="leave out files of this schema, e.g. mbp-10 (depth is "
+                         "streamed into features, never written as one table)")
     ap.add_argument("--list", action="store_true",
                     help="print what every raw file holds (any ticker); write nothing")
     args = ap.parse_args(argv)
@@ -971,10 +985,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if args.dry_run:
                 # Progress goes to stderr so stdout is the plan, as clean JSON.
                 m = ingest(args.symbol, args.raw_dir, args.out_dir, force=args.force,
-                           dry_run=True, log=lambda *a: print(*a, file=sys.stderr))
+                           dry_run=True, log=lambda *a: print(*a, file=sys.stderr),
+                           skip_schemas=args.skip_schema)
                 print(json.dumps(m, indent=2))
                 return 0
-            ingest(args.symbol, args.raw_dir, args.out_dir, force=args.force)
+            ingest(args.symbol, args.raw_dir, args.out_dir, force=args.force,
+                   skip_schemas=args.skip_schema)
     except IngestError as e:
         print(f"\nINGEST FAILED: {e}", file=sys.stderr)
         return 1

@@ -75,30 +75,40 @@ undefined. B should treat those integer maxima as missing.
 Prices are float, in contract units, not scaled. Native Databento dtypes are
 kept (`instrument_id` is `uint32`, `size` is `uint32`).
 
-## CSV trades (NG, HG)
+## Trades that need narrowing (NG, HG, ES, CL, GC)
 
-NG and HG trades exist only as a Databento batch job encoded as CSV, pulled
-as the parent (`NG.FUT`): every contract month and every spread, in daily
-`.trades.csv.zst` files. `ingest_csv.py`, called from `ingest.py`, turns that
-into the same `data/<SYM>/trades.parquet` a `NG.v.0` DBN pull would give:
+Five contracts' trades are not one continuous DBN series:
 
-- The job is identified from its `metadata.json` (encoding, schema, parent
-  symbol), and every file is hashed against the job's `manifest.json`.
+| | What we have |
+|---|---|
+| NG, HG | Nolan's CSV batch job, parent pull (`NG.FUT`): every month and spread |
+| ES | Arjan's half DBN `ES.v.0`, Demetrios's half DBN `ES.FUT` (parent) |
+| CL, GC | Connor's raw exports: one CSV each of `CL.v.0` / `GC.n.0`, no manifest |
+
+`ingest_csv.py`, called from `ingest.py`, turns each into the same
+`data/<SYM>/trades.parquet` a single continuous DBN pull would give:
+
+- Each source is identified from its own metadata: `metadata.json` for a CSV
+  job, the DBN header, or the CSV header and `symbol` column for an export.
+  Files listed in a job's `manifest.json` are hashed against it.
 - Which contract to keep on each date comes from the roll Databento records
-  in the header of the continuous-series files being ingested alongside (the
-  `NG.v.0` minute bars). A row is kept if its `instrument_id` is the one
-  mapped for the UTC date of its `ts_recv`; `symbol` becomes `NG.v.0`.
+  in the header of the contract's continuous minute bars. A row is kept if its
+  `instrument_id` is the one mapped for the UTC date of its `ts_recv`;
+  `symbol` becomes the bars' series. Rows of other contracts are dropped only
+  from parent pulls. A continuous source with a row the roll doesn't name, or
+  whose own roll differs from the bars' on any date, stops the run.
 - The result is checked against Databento's own minute bars: bars rebuilt
   from the kept trades, bucketed by `ts_recv`, must equal `ohlcv1m.parquet`
-  bar for bar, or the run stops. On the real data: HG 512,262 of 512,262
-  bars, NG 469,616 of 469,616.
-- The manifest's `trades` entry carries `converted_from_csv` (the job, every
+  bar for bar, or the run stops. On the real data every contract matched
+  exactly: HG 512,262 bars, NG 469,616, ES 531,442, and CL and GC likewise.
+- The manifest's `trades` entry carries `narrowed` (every source, every
   contract the roll used and from which date) and the rows read vs kept.
-- A DBN trades download for the same root always wins; the CSV job is then
-  listed under `csv_jobs_not_used`.
+- One kind of DBN trades pull (one continuous series, or one parent pull)
+  takes the ordinary path and wins over any CSV; the CSV is then listed under
+  `trades_sources_not_used`.
 
-Without a continuous-series file for the root in the same raw folder,
-ingestion stops rather than estimate the roll.
+`--skip-schema mbp-10` leaves depth out: book data is streamed into features
+(piece D), never written as one table.
 
 ## What ingestion does *not* do — all of it is cleaning
 

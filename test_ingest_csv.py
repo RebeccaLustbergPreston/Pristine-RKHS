@@ -172,7 +172,7 @@ def test_only_the_rolled_contract_is_kept_and_spreads_dropped():
         assert set(t["symbol"]) == {"NG.v.0"}
         e = m["outputs"]["trades"]
         assert e["rows"] == len(_kept(rows)) and e["rows_read"] == len(rows)
-        assert e["converted_from_csv"]["roll"]["contracts"] == [
+        assert e["narrowed"]["roll"]["contracts"] == [
             {"from": DAY1, "instrument_id": FRONT}, {"from": DAY2, "instrument_id": NEXT}]
         assert any("ohlcv-1m" in c and "bars" in c for c in e["checks_passed"])
 
@@ -213,8 +213,8 @@ def test_dbn_trades_take_precedence_and_the_csv_job_is_recorded():
         dbn_tree(f"{d}/raw")
         write_csv_job(f"{d}/raw/csvjob", _rows())
         m = ingest("NG", f"{d}/raw", f"{d}/out", log=_quiet)
-        assert "converted_from_csv" not in m["outputs"]["trades"]
-        assert [j["why"] for j in m["csv_jobs_not_used"]] == ["DBN trades are present"]
+        assert "narrowed" not in m["outputs"]["trades"]
+        assert [j["why"] for j in m["trades_sources_not_used"]] == ["DBN trades are present"]
 
 
 def test_hash_mismatch_with_job_manifest_fails_loudly():
@@ -254,7 +254,7 @@ def test_csv_job_for_another_root_is_left_alone():
         dbn_tree(f"{d}/raw")
         write_csv_job(f"{d}/raw/hg", _rows(), metadata={"symbols": ["HG.FUT"]})
         m = ingest("NG", f"{d}/raw", f"{d}/out", log=_quiet)
-        assert m["csv_jobs_not_used"] == []
+        assert m["trades_sources_not_used"] == []
 
 
 def test_dry_run_writes_nothing_and_describes_the_roll():
@@ -262,7 +262,7 @@ def test_dry_run_writes_nothing_and_describes_the_roll():
         csv_tree(f"{d}/raw")
         m = ingest("NG", f"{d}/raw", f"{d}/out", dry_run=True, log=_quiet)
         assert not os.path.exists(f"{d}/out")
-        assert m["outputs"]["trades"]["converted_from_csv"]["roll"]["series"] == "NG.v.0"
+        assert m["outputs"]["trades"]["narrowed"]["roll"]["series"] == "NG.v.0"
 
 
 def test_one_file_or_daily_files_give_the_same_output():
@@ -273,6 +273,98 @@ def test_one_file_or_daily_files_give_the_same_output():
         ingest("NG", f"{d}/b", f"{d}/ob", log=_quiet)
         pd.testing.assert_frame_equal(pd.read_parquet(f"{d}/oa/NG/trades.parquet"),
                                       pd.read_parquet(f"{d}/ob/NG/trades.parquet"))
+
+
+
+# ── CSV exports of a continuous pull (Connor's CL, GC) ───────────────────────
+
+def _export(path, rows):
+    """A to_df().to_csv() export: pandas timestamp format, plain .csv."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    lines = [",".join(("ts_recv", "ts_event", "rtype", "publisher_id", "instrument_id",
+                       "action", "side", "depth", "price", "size", "flags",
+                       "ts_in_delta", "sequence", "symbol"))]
+    for rcv, evt, iid, px, size, side, seq, _ in rows:
+        f = lambda ns: str(pd.Timestamp(ns, unit="ns", tz="UTC"))
+        lines.append(f"{f(rcv)},{f(evt)},0,1,{iid},T,{side},0,{px / NS!r},{size},0,"
+                     f"{rcv - evt},{seq},NG.v.0")
+    with open(path, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def test_csv_export_of_continuous_pull_equals_the_dbn_pull():
+    with tempfile.TemporaryDirectory() as d:
+        kept = _kept(_rows())
+        _export(f"{d}/a/connor/gold_named_wrong.csv", kept)
+        write_bars(f"{d}/a/bars/x.dbn.zst", kept)
+        dbn_tree(f"{d}/b")
+        m = ingest("NG", f"{d}/a", f"{d}/oa", log=_quiet)
+        ingest("NG", f"{d}/b", f"{d}/ob", log=_quiet)
+        assert m["outputs"]["trades"]["narrowed"]["sources"][0]["source"] == \
+            "csv_export_of_continuous_pull"
+        pd.testing.assert_frame_equal(pd.read_parquet(f"{d}/oa/NG/trades.parquet"),
+                                      pd.read_parquet(f"{d}/ob/NG/trades.parquet"))
+
+
+def test_continuous_export_with_an_off_roll_row_fails_rather_than_dropping():
+    with tempfile.TemporaryDirectory() as d:
+        rows = _rows()
+        kept = _kept(rows)
+        stray = next(x for x in rows if x[2] == SPREAD)
+        _export(f"{d}/raw/x.csv", sorted(kept + [stray]))
+        write_bars(f"{d}/raw/bars/x.dbn.zst", kept)
+        _expect_error(lambda: ingest("NG", f"{d}/raw", f"{d}/out", log=_quiet),
+                      "does not name")
+
+
+# ── DBN halves of different series (ES) ──────────────────────────────────────
+
+def _dbn_trades(path, rows, symbols, stype, mappings):
+    recs = [dbn.TradeMsg(publisher_id=1, instrument_id=iid, ts_event=evt, price=px,
+                         size=size, action=dbn.Action.TRADE,
+                         side={"A": dbn.Side.ASK, "B": dbn.Side.BID, "N": dbn.Side.NONE}[side],
+                         depth=0, ts_recv=rcv, flags=0, ts_in_delta=rcv - evt, sequence=seq)
+            for rcv, evt, iid, px, size, side, seq, _ in rows]
+    write_dbn(path, dbn.Schema.TRADES, symbols, *mappings[1], recs, mappings[0], stype=stype)
+
+
+def _split(rows):
+    d2 = _ns(DAY2)
+    return [x for x in rows if x[0] < d2], [x for x in rows if x[0] >= d2]
+
+
+def test_continuous_half_and_parent_half_are_joined_on_the_roll():
+    with tempfile.TemporaryDirectory() as d:
+        rows = _rows()
+        first, second = _split(rows)
+        # First half: another continuous series that rolls the same way (v vs n).
+        _dbn_trades(f"{d}/a/arjan/t.dbn.zst", _kept(first), ["NG.c.0"],
+                    dbn.SType.CONTINUOUS, ([_mapping("NG.c.0", FRONT, DAY1, DAY2)], (DAY1, DAY2)))
+        # Second half: the parent, every contract and spread.
+        _dbn_trades(f"{d}/a/demetrios/t.dbn.zst", second, ["NG.FUT"], dbn.SType.PARENT,
+                    ([_mapping("NGZ3", FRONT, DAY2, END), _mapping("NGF4", NEXT, DAY2, END),
+                      _mapping("NGZ3-NGF4", SPREAD, DAY2, END)], (DAY2, END)))
+        write_bars(f"{d}/a/bars/x.dbn.zst", _kept(rows))
+        dbn_tree(f"{d}/b")
+        m = ingest("NG", f"{d}/a", f"{d}/oa", log=_quiet)
+        ingest("NG", f"{d}/b", f"{d}/ob", log=_quiet)
+        assert [s["source"] for s in m["outputs"]["trades"]["narrowed"]["sources"]] == ["dbn", "dbn"]
+        pd.testing.assert_frame_equal(pd.read_parquet(f"{d}/oa/NG/trades.parquet"),
+                                      pd.read_parquet(f"{d}/ob/NG/trades.parquet"))
+
+
+def test_other_series_that_rolls_differently_fails_loudly():
+    with tempfile.TemporaryDirectory() as d:
+        rows = _rows()
+        first, second = _split(rows)
+        _dbn_trades(f"{d}/raw/a.dbn.zst", [x for x in first if x[2] == NEXT], ["NG.c.0"],
+                    dbn.SType.CONTINUOUS, ([_mapping("NG.c.0", NEXT, DAY1, DAY2)], (DAY1, DAY2)))
+        _dbn_trades(f"{d}/raw/b.dbn.zst", second, ["NG.FUT"], dbn.SType.PARENT,
+                    ([_mapping("NGF4", NEXT, DAY2, END), _mapping("NGZ3", FRONT, DAY2, END),
+                      _mapping("NGZ3-NGF4", SPREAD, DAY2, END)], (DAY2, END)))
+        write_bars(f"{d}/raw/bars/x.dbn.zst", _kept(rows))
+        _expect_error(lambda: ingest("NG", f"{d}/raw", f"{d}/out", log=_quiet),
+                      "different contracts that day")
 
 
 if __name__ == "__main__":
