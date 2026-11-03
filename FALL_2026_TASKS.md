@@ -13,7 +13,78 @@ author can run it from a clean clone and get the same answer.
 
 ---
 
-## A. Decide the data source — blocking, do in week 1
+## Where things stand — 3 November 2026
+
+Sections A, B and C1–C2 below are overtaken by events and kept for the
+record. Read this first.
+
+**The data is bought, ingested and cleaned.** Eight contracts — CL, NG, HG,
+GC, ZC, ZT, ES, BTC — from Databento, 2 July 2023 to 31 December 2024, in
+Box under each contract's folder. Order-book depth (`mbp-10`) for CL, NG, HG
+and ZC. Micro bitcoin and micro gold (MBT, MGC) were pulled for position
+sizing only and are not cleaned.
+
+- **Ingestion** (`ingest.py`, `ingest_csv.py`, branch `rebecca/master-clean`):
+  every contract's trades rebuild Databento's own minute bars exactly. Four
+  contracts needed narrowing to one series by Databento's roll — NG and HG
+  (CSV parent pulls), ES (two halves of different series), CL and GC
+  (Connor's CSV exports). See `docs/ingestion_format.md`.
+- **Cleaning** (`clean.py`, `check_cleaned.py`): all eight in
+  `data/cleaned-master/<SYM>/` with `cleaning_report.json`, 378 exchange
+  sessions each, no empty sessions, every check in
+  `docs/data_cleaning_standard.md` §5 passing.
+- **CL is now `CL.v.0`**, 40.6M trades, not the old `CL.c.0` tape (36.7M).
+  Every CL number in `POSTMORTEM.md` was on the old tape.
+- **There are 378 exchange sessions in the window, not 468.** 468 counted
+  calendar days that had trades (Sunday evenings, holidays). Anything set in
+  days — `WARMUP_DAYS`, fold sizes, the embargo, the VIX join in invariant 3
+  — should be checked against 378.
+
+**Two names for two lists.** The work pieces handed out in September are
+lettered A–F, and so are the sections of this file. They are not the same
+thing:
+
+| Piece (who does it) | Is this section's |
+|---|---|
+| A — ingestion (Ferris, Zach) | done (C1 superseded) |
+| B — cleaning | done (master pass) |
+| C — loader, bar size, trading cost | C3, D2, and step 1 below |
+| D — book features from depth | step 6 below |
+| E — roll calendar, switch returns | D0, H2, H3 |
+| F — measurement | E |
+
+## Build order from here
+
+Each step names what it waits on. Nothing is tuned against a score until
+step 7 has a score that tells real results from shuffled ones.
+
+1. **Loader** (piece C, C3). `DataLoader(symbol)` reads
+   `data/cleaned-master/<SYM>/` and exposes contract switches. Trading cost
+   per contract comes from tick value — see the correction in C3.
+2. **Decide: predict hours or days** (`TODO.md` item 3). This sets what the
+   bar size in step 5 has to achieve. Recommendation: a daily target, with
+   bars used only to build the fast features — F1 and G both work on the
+   daily calendar.
+3. **D0 on the new CL.** Re-run `validate_pipeline.py` on the cleaned
+   `CL.v.0` first, so the source change and the fix are measured separately.
+   The cleaning report lists all 18 switches with their price gaps.
+4. **D1**, `build_features_for_symbol`, with CL still on its fixed bar size
+   so results match the step 3 baseline exactly.
+5. **D2**, bar size per contract by rule (waits on step 2).
+6. **Book features from depth** (piece D) for CL, NG, HG, ZC — streamed from
+   the raw `mbp-10` files into the `.npz` layout in the cleaning standard,
+   never loaded as a table.
+7. **E0, then E1 and E3.** E3 passing is the gate for everything after it.
+8. **H2, H3.** H2 is mostly in hand: each ingestion manifest records which
+   contract Databento's roll held on every date.
+9. **F**, then **G**, then **I**.
+
+---
+
+## A. Decide the data source — done
+
+*Settled in September: Databento, bought per contract. Kept below for the
+record.*
 
 Everything downstream depends on this and nothing else should start until
 it is answered.
@@ -60,7 +131,12 @@ for the same problem before building on it.
 
 ---
 
-## B. Pick the ten contracts — week 1 to 2
+## B. Pick the ten contracts — done (eight)
+
+*Settled: CL, NG, HG, GC, ZC, ZT, ES, BTC — average pairwise correlation
+0.098, worst pair GC–HG 0.41. Silver dropped (0.77 with gold); VIX ruled out
+(Cboe-listed, and already a VRP input). The ownership table below predates
+that choice.*
 
 **B1. Screen candidates on four things:** average daily volume, whether
 the chosen data source actually covers them, contract size (can a paper
@@ -93,9 +169,10 @@ matrix.
 
 ---
 
-## C. Pull and cache the data — weeks 2 to 5
+## C. Pull and cache the data — C1, C2 done; C3 open
 
-**C1. Write one puller that takes a symbol** and produces the same file
+**C1. Write one puller that takes a symbol** *(superseded: pulled once by
+Rebecca; `ingest.py` plays this role)* and produces the same file
 layout we already use, so `data_loader.py` needs no special cases:
 
 ```
@@ -108,7 +185,9 @@ data/<SYMBOL>/LOB/                    book features, if A2 allows
 *Acceptance:* `pull.py --symbol NG` runs start to finish and the output
 passes the same validation as CL.
 
-**C2. Storage decision, made before the bulk pull, not after.** CL alone
+**C2. Storage decision, made before the bulk pull, not after.** *(done:
+raw and cleaned data in Box, each Databento job with its manifest; cleaned
+files in `cleaned-master/`)* CL alone
 is 2.8 GB for 18 months. Ten contracts of raw tick data is 8 to 30 GB
 depending on liquidity, and ES will be the heaviest by some margin.
 Computed features are ~55 MB per contract, so the whole set of ten fits in
@@ -123,17 +202,29 @@ live, and how does a new team member get both".
 
 **C3. Per-contract cost and tick size.** The backtest currently hardcodes
 one cost number (0.00015, roughly a tick on CL at $70). That is wrong for
-nine of the ten. The definitions file already carries
-`min_price_increment` and `min_price_increment_amount` per contract — wire
-them in.
+the other seven.
 
-*Acceptance:* cost per trade is derived per symbol, not a constant.
+**Do not use `min_price_increment_amount` as the dollar value of a tick.**
+In this data it isn't one: CL shows 0.1 where a tick is worth $10, and the
+error is not one constant factor across contracts. Compute it as
+`min_price_increment × unit_of_measure_qty`, divided by 100 where the price
+is quoted in cents (ZC) or percent of par (ZT):
+
+| | CL | NG | HG | GC | ZC | ZT | ES | BTC |
+|---|---|---|---|---|---|---|---|---|
+| tick value | $10 | $10 | $12.50 | $10 | $12.50 | $7.8125 | $12.50 | $25 |
+
+*Acceptance:* cost per trade is derived per symbol, not a constant, and a
+test pins the table above.
 
 ---
 
 ## D. Make the pipeline run per symbol — weeks 2 to 5
 
-**D0. Remove the fake contract-switch returns from CL — do first.** Our
+**D0. Remove the fake contract-switch returns from CL — do first.**
+*Run it on the cleaned `CL.v.0` (see "Where things stand"), after a fresh
+`validate_pipeline.py` baseline on that tape. The counts below are from the
+old `CL.c.0` tape; the cleaning report has the new list, also 18 switches.* Our
 CL tape joins 19 contracts without adjusting prices, so the 18 switches
 put 18 fake returns into the forward-return target (median 0.95%, largest
 2.14%, 14 of 18 downward, against a typical bar move of about 0.5%). Every
@@ -162,11 +253,28 @@ the daily axis where calendars line up.
 identical to the post-D0 baseline, and `validate_pipeline.py` still passes.
 
 **D2. Per-symbol config.** Dollar-bar threshold cannot stay at $1M for
-every contract — that is tuned to CL's notional. Set it per symbol so bar
-counts land in a comparable range.
+every contract. The "dollar" in the code is price × contracts, with no
+contract multiplier, so the same threshold means something different in
+every market. Measured on the cleaned data:
+
+| bars per day at "$1M" | CL | NG | HG | ZC | ZT | GC | BTC | ES |
+|---|---|---|---|---|---|---|---|---|
+| first 60 sessions | 17.8 | 0.2 | 0.2 | 45 | 47 | 276 | 169 | 6,214 |
+| last 60 sessions | 12.5 | 0.3 | 0.2 | 54 | 66 | 406 | 733 | 7,171 |
+
+NG and HG would get a bar every five days. The count also drifts within a
+contract as its price moves — BTC fourfold over the window.
+
+**Set the threshold by rule, never by score.** Same target bars per session
+for every contract, from a threshold that looks only backwards: for
+example, the trailing 20-session median of price × size divided by the
+target. Choosing the target count is not tuning — it follows from the
+horizon decision (`TODO.md` item 3) and the longest feature window (VPIN's
+50 bars). Choosing it by backtest result is exactly what Runs 1–25 did.
 
 *Acceptance:* every symbol produces roughly the same number of bars per
-day, documented.
+session, documented, with a test that the threshold for session *d* uses
+nothing from session *d* or later.
 
 ---
 
@@ -348,6 +456,9 @@ time.
 ---
 
 ## Sequencing at a glance
+
+*Superseded by "Build order from here" at the top; kept for the original
+week plan.*
 
 ```
 Week  1     A (data source)  ·  B (pick assets)

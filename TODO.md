@@ -4,7 +4,12 @@ Ordered roughly by what blocks what. Each item says *why* it matters, not
 just what to do — if a reason stops being true, drop the item.
 
 Background for all of it is in `POSTMORTEM.md` (what was broken) and
-`HANDOFF.md` (where this is going).
+`HANDOFF.md` (where this is going). The order to do things in is
+"Build order from here" at the top of `FALL_2026_TASKS.md`.
+
+**3 November 2026:** eight contracts are ingested and cleaned (item 4 is
+done), and CL is now the cleaned `CL.v.0` tape rather than `CL.c.0`. See
+"Where things stand" in `FALL_2026_TASKS.md`.
 
 ---
 
@@ -37,6 +42,12 @@ calendar in `FALL_2026_TASKS.md` H2.
 **How to know you succeeded:** a test that no target return spans a
 contract switch, and `validate_pipeline.py` still passes. Expect the
 headline numbers to move, and re-run the seed matrix before quoting any.
+
+**Now on the cleaned tape.** The figures above are from the old `CL.c.0`
+tape. The cleaned CL is `CL.v.0`, also 18 switches, each listed with its
+price gap in `data/cleaned-master/CL/cleaning_report.json`. Re-run
+`validate_pipeline.py` on the new tape before this fix, so the change of
+source and the fix are measured separately.
 
 ---
 
@@ -88,11 +99,20 @@ one. Neither is necessarily wrong, but they should match. Pick one:
 This is cheap to change and probably affects results more than most of the
 parameter tuning in the old run history.
 
+**It now blocks per-contract bar sizes** (`FALL_2026_TASKS.md` D2): how many
+bars a session should have depends on whether bars are the thing being
+predicted or only the raw material for features. Recommendation: a daily
+target — the cross-sectional plan (item 6) and the ablation both work on
+the daily calendar — with bars used only to build the fast features.
+
 ---
 
-## 4. Get tick data for more contracts
+## 4. Get tick data for more contracts — done
 
-**This is what actually blocks the multi-asset project.**
+*Done in October–November 2026: eight contracts from Databento, ingested and
+cleaned. Kept for the reasoning.*
+
+**This is what actually blocked the multi-asset project.**
 
 The kernels are built from trade-by-trade and order-book data — who traded,
 how much, how fast, how deep the book was. Daily closing prices don't
@@ -125,6 +145,12 @@ then happens on the daily calendar, where the dates actually line up.
 
 Extract a `build_features_for_symbol(symbol)` function first. Everything
 else follows from that.
+
+**The bar size has to change per contract, by rule.** The $1M "dollar bar"
+is price × contracts with no multiplier, so it gives 0.2 bars a day on NG
+and HG and about 7,000 on ES. Set the threshold so every contract gets the
+same bars per session, from trailing data only — never by which size scores
+best. Details and measurements in `FALL_2026_TASKS.md` D2.
 
 **Please keep `validate_pipeline.py` passing throughout.** Multi-asset work
 multiplies the number of places a date can be misaligned, and all five bugs
@@ -188,8 +214,20 @@ in testing.
 - **Check the transaction cost assumption.** Costs are modelled as a flat
   0.015% per trade, roughly one tick on CL ($0.01/bbl, $10 a contract) at
   $70/barrel. That's a
-  reasonable guess for CL and probably wrong for other contracts. Revisit
-  when the book expands.
+  reasonable guess for CL and wrong for the other seven. Derive it from each
+  contract's tick value — and note that the definitions field
+  `min_price_increment_amount` is not that value in our data
+  (`FALL_2026_TASKS.md` C3 has the correct table).
+
+- **Amend `docs/data_cleaning_standard.md`.** Two rules are wrong for CME
+  data, and `clean.py` departs from both with the evidence in each report:
+  rule c (de-duplicate on `ts_event` + `sequence`) deletes real trades, since
+  one order filling at several prices is several trades in one packet — in
+  Connor's CL it removed 1.9% of trades, and on HG it would break volume in
+  118k of 512k minutes; and rule f
+  should roll holiday evenings to the next settlement day, not the clock
+  date. Connor's CL followed the standard as written and differs in exactly
+  these two ways, so it should stop being described as the reference.
 
 ---
 
