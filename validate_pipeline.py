@@ -23,6 +23,7 @@ Usage:
     .venv/bin/python validate_pipeline.py             # 3 seeds, ~25 min
     .venv/bin/python validate_pipeline.py --seeds 1   # quick pass
     .venv/bin/python validate_pipeline.py --reuse     # skip completed runs
+    DATA_SOURCE=cleaned .venv/bin/python validate_pipeline.py   # cleaned CL
 
 Exits non-zero if a check that must pass does not.
 """
@@ -66,6 +67,9 @@ LEAKAGE_TOLERANCE = 0.05
 
 def results_path(mode: str, seed: int) -> str:
     label = "2fast_3slow_twostage_v2_kalman_wu60"
+    source = os.environ.get("DATA_SOURCE", "legacy").lower()
+    if source != "legacy":
+        label += f"_src-{source}"
     if mode != "none":
         label += f"_null-{mode}"
     if seed != 0:

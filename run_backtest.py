@@ -38,6 +38,12 @@ _ROOT = os.path.dirname(os.path.abspath(__file__))
 # for SEED=0 is a result about one draw, not about the strategy.
 _SEED_OFFSET = int(os.environ.get("SEED", "0"))
 
+# Which data the run reads (see data_loader.py): "legacy" is the original
+# CL.c.0 files every POSTMORTEM.md number came from; "cleaned" is
+# data/cleaned-master/CL/ (CL.v.0, exchange sessions). Cleaned runs carry
+# "_src-cleaned" in their results file name so the two never overwrite.
+DATA_SOURCE = os.environ.get("DATA_SOURCE", "legacy").lower()
+
 
 def _seed(base: int) -> int:
     return base + _SEED_OFFSET
@@ -763,12 +769,13 @@ def main():
     t0 = time.time()
     print("=" * 70)
     print("  Pristine-RKHS Walk-Forward Backtest")
-    print(f"  CL Futures | Jul 2023 - Dec 2024 | arch={os.environ.get('ARCH_VERSION', 'v1')}")
+    print(f"  CL Futures | Jul 2023 - Dec 2024 | arch={os.environ.get('ARCH_VERSION', 'v1')} "
+          f"| data={DATA_SOURCE}")
     print("=" * 70)
 
     # ── 1. Load data ─────────────────────────────────────────────────────
     print("\n[1/7] Loading data...")
-    dl = DataLoader(os.path.join(_ROOT, "data"))
+    dl = DataLoader(os.path.join(_ROOT, "data"), "CL", source=DATA_SOURCE)
     dates = dl.trading_dates()
     print(f"  LOB dates: {len(dates)} ({dates[0]} — {dates[-1]})")
 
@@ -2501,7 +2508,8 @@ def main():
     run_label = f"{n_fast_k}fast_{n_slow_k}slow_twostage{arch_tag}{target_tag}{horizon_tag}{signal_tag}{loss_tag}{adaptive_tag}{warmup_tag}"
     null_tag = "" if NULL_MODE == "none" else f"_null-{NULL_MODE}"
     seed_tag = "" if _SEED_OFFSET == 0 else f"_seed{_SEED_OFFSET}"
-    run_label = f"{run_label}{null_tag}{seed_tag}"
+    src_tag = "" if DATA_SOURCE == "legacy" else f"_src-{DATA_SOURCE}"
+    run_label = f"{run_label}{src_tag}{null_tag}{seed_tag}"
     results_file = os.path.join(_ROOT, f"backtest_results_{run_label}.npz")
     np.savez(
         results_file,

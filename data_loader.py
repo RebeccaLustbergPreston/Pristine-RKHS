@@ -4,8 +4,18 @@ Data Loader — bridges raw parquet/npz/pkl data into the 10-kernel pipeline.
 Usage:
     from data_loader import DataLoader
 
-    dl = DataLoader("data/")
+    dl = DataLoader("data/")                       # legacy CL files
+    dl = DataLoader("data/", "NG", source="cleaned")   # data/cleaned-master/NG/
     dl.load_all()
+
+Two sources:
+    legacy   the original CL files, data/trades_CL_full.parquet etc. (CL.c.0).
+             Every result in POSTMORTEM.md came from these.
+    cleaned  data/cleaned-master/<SYMBOL>/, written by clean.py to
+             docs/data_cleaning_standard.md for all eight contracts. Daily
+             bars group by the exchange session (session_date), not the UTC
+             calendar date, and contract switches and tick values are
+             available per symbol.
 
     # Fast kernels (dollar-bar resolution)
     lob_snapshots = dl.lob_snapshots("2023-07-10")
@@ -26,6 +36,7 @@ Usage:
 
 import os
 import glob
+import json
 import pickle
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -52,6 +63,19 @@ class LOBSnapshot:
     timestamp: int             # dollar-bar index
 
 
+# ── Contract economics ───────────────────────────────────────────────────────
+
+# Where a contract's price is quoted in cents (ZC) or percent of par (ZT),
+# price × unit_of_measure_qty must be scaled to dollars. The definitions field
+# min_price_increment_amount is *not* the dollar value of a tick in this data
+# (CL shows 0.1 for a $10 tick), so tick value is computed instead.
+QUOTE_TO_DOLLARS = {"ZC": 0.01, "ZT": 0.01}
+
+SOURCES = ("legacy", "cleaned")
+_CLEANED_TRADE_COLUMNS = ["ts_event", "ts_recv", "price", "size", "side",
+                          "instrument_id", "symbol", "session_date", "outlier_flag"]
+
+
 # ── Main loader ──────────────────────────────────────────────────────────────
 
 class DataLoader:
@@ -63,12 +87,20 @@ class DataLoader:
     data_dir : str
         Path to the data/ folder (default: "data/").
     symbol : str
-        Symbol prefix for file matching (default: "CL").
+        Contract root (default: "CL").
+    source : str
+        "legacy" (default) or "cleaned" — see the module docstring.
     """
 
-    def __init__(self, data_dir: str = "data/", symbol: str = "CL"):
+    def __init__(self, data_dir: str = "data/", symbol: str = "CL",
+                 source: str = "legacy"):
+        if source not in SOURCES:
+            raise ValueError(f"source={source!r}; expected one of {SOURCES}")
+        if source == "legacy" and symbol != "CL":
+            raise ValueError("legacy data exists for CL only; use source='cleaned'")
         self.data_dir = os.path.abspath(data_dir)
-        self.symbol = symbol
+        self.symbol = symbol.upper()
+        self.source = source
 
         # Caches (lazy-loaded)
         self._trades: Optional["pd.DataFrame"] = None
@@ -82,16 +114,35 @@ class DataLoader:
     # ── File paths ───────────────────────────────────────────────────────
 
     @property
+    def cleaned_dir(self) -> str:
+        return os.path.join(self.data_dir, "cleaned-master", self.symbol)
+
+    def _cleaned(self, name: str) -> str:
+        return os.path.join(self.cleaned_dir, name)
+
+    @property
     def trades_path(self) -> str:
+        if self.source == "cleaned":
+            return self._cleaned("trades.parquet")
         return os.path.join(self.data_dir, f"trades_{self.symbol}_full.parquet")
 
     @property
     def ohlcv_path(self) -> str:
+        if self.source == "cleaned":
+            return self._cleaned("ohlcv1m.parquet")
         return os.path.join(self.data_dir, f"ohlcv1m_{self.symbol}_full.parquet")
 
     @property
     def definitions_path(self) -> str:
+        if self.source == "cleaned":
+            return self._cleaned("definitions.parquet")
         return os.path.join(self.data_dir, f"definition_{self.symbol}_FUT_full.parquet")
+
+    @property
+    def statistics_path(self) -> str:
+        if self.source != "cleaned":
+            raise FileNotFoundError("statistics are only in the cleaned source")
+        return self._cleaned("statistics.parquet")
 
     @property
     def options_path(self) -> str:
@@ -111,7 +162,10 @@ class DataLoader:
         """
         self._require_pandas()
         if self._trades is None:
-            self._trades = pd.read_parquet(self.trades_path)
+            # The cleaned tape carries every raw field; the kernels need only
+            # these, and reading fewer columns roughly halves the memory.
+            cols = _CLEANED_TRADE_COLUMNS if self.source == "cleaned" else None
+            self._trades = pd.read_parquet(self.trades_path, columns=cols)
             if "ts_event" in self._trades.columns:
                 self._trades["ts_event"] = pd.to_datetime(
                     self._trades["ts_event"], utc=True
@@ -132,6 +186,9 @@ class DataLoader:
         self._require_pandas()
         if self._ohlcv is None:
             self._ohlcv = pd.read_parquet(self.ohlcv_path)
+            if self.source == "cleaned":
+                # Same shape as the legacy file: ts_event is the index.
+                self._ohlcv = self._ohlcv.set_index("ts_event")
         df = self._ohlcv
         if date_range:
             start, end = pd.Timestamp(date_range[0], tz="UTC"), pd.Timestamp(date_range[1], tz="UTC")
@@ -165,6 +222,51 @@ class DataLoader:
             start, end = pd.Timestamp(date_range[0], tz="UTC"), pd.Timestamp(date_range[1], tz="UTC")
             df = df[(df["ts_event"] >= start) & (df["ts_event"] <= end)]
         return df
+
+    def cleaning_report(self) -> dict:
+        """The cleaned contract's cleaning_report.json."""
+        if self.source != "cleaned":
+            raise FileNotFoundError("cleaning reports exist for the cleaned source only")
+        with open(self._cleaned("cleaning_report.json")) as fh:
+            return json.load(fh)
+
+    def contract_switches(self) -> "pd.DataFrame":
+        """Every change of contract in the trade tape, from the cleaning
+        report: session_date, ts_event, from, to, price_gap_pct. Nothing in
+        the data is adjusted across them — that is a downstream decision."""
+        self._require_pandas()
+        df = pd.DataFrame(self.cleaning_report()["contract_switches"])
+        df["ts_event"] = pd.to_datetime(df["ts_event"], utc=True, format="ISO8601").astype(
+            "datetime64[ns, UTC]")
+        df["session_date"] = pd.to_datetime(df["session_date"]).astype("datetime64[ns]")
+        return df
+
+    def _front_definition(self) -> "pd.Series":
+        """Definition of the contract the tape held last (an outright)."""
+        defs = self.definitions()
+        last_id = int(self.contract_switches()["to"].iloc[-1]) \
+            if self.source == "cleaned" and len(self.contract_switches()) else None
+        d = defs[defs["instrument_id"] == last_id] if last_id is not None else defs.iloc[0:0]
+        if d.empty:
+            d = defs[~defs["raw_symbol"].astype(str).str.contains(r"[-: ]", regex=True)]
+        if d.empty:
+            raise ValueError(f"{self.symbol}: no outright contract in definitions")
+        return d.iloc[-1]
+
+    def tick_size(self) -> float:
+        """Minimum price increment, in the contract's quoted price units."""
+        return float(self._front_definition()["min_price_increment"])
+
+    def tick_value(self) -> float:
+        """Dollar value of one tick on one contract."""
+        d = self._front_definition()
+        return float(d["min_price_increment"]) * float(d["unit_of_measure_qty"]) \
+            * QUOTE_TO_DOLLARS.get(self.symbol, 1.0)
+
+    def cost_per_trade(self, price: float, ticks: float = 1.0) -> float:
+        """Cost of crossing ``ticks`` ticks, as a fraction of ``price`` — the
+        unit COST_PER_TRADE uses (one tick on CL at $70 ≈ 0.00014)."""
+        return ticks * self.tick_size() / float(price)
 
     # ── LOB pre-computed data ────────────────────────────────────────────
 
@@ -348,7 +450,12 @@ class DataLoader:
         """
         self._require_pandas()
         ohlcv = self.ohlcv(date_range)
-        daily = ohlcv.groupby(ohlcv.index.date).agg({
+        # Cleaned data: one row per exchange session (378 in the window). The
+        # legacy file has no session tag, so it groups by UTC calendar date,
+        # which splits each evening session from its day (468 rows).
+        key = ohlcv["session_date"].values if self.source == "cleaned" \
+            else ohlcv.index.date
+        daily = ohlcv.groupby(key).agg({
             "open": "first",
             "high": "max",
             "low": "min",
