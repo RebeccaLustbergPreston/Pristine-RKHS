@@ -75,6 +75,31 @@ undefined. B should treat those integer maxima as missing.
 Prices are float, in contract units, not scaled. Native Databento dtypes are
 kept (`instrument_id` is `uint32`, `size` is `uint32`).
 
+## CSV trades (NG, HG)
+
+NG and HG trades exist only as a Databento batch job encoded as CSV, pulled
+as the parent (`NG.FUT`): every contract month and every spread, in daily
+`.trades.csv.zst` files. `ingest_csv.py`, called from `ingest.py`, turns that
+into the same `data/<SYM>/trades.parquet` a `NG.v.0` DBN pull would give:
+
+- The job is identified from its `metadata.json` (encoding, schema, parent
+  symbol), and every file is hashed against the job's `manifest.json`.
+- Which contract to keep on each date comes from the roll Databento records
+  in the header of the continuous-series files being ingested alongside (the
+  `NG.v.0` minute bars). A row is kept if its `instrument_id` is the one
+  mapped for the UTC date of its `ts_recv`; `symbol` becomes `NG.v.0`.
+- The result is checked against Databento's own minute bars: bars rebuilt
+  from the kept trades, bucketed by `ts_recv`, must equal `ohlcv1m.parquet`
+  bar for bar, or the run stops. On the real data: HG 512,262 of 512,262
+  bars, NG 469,616 of 469,616.
+- The manifest's `trades` entry carries `converted_from_csv` (the job, every
+  contract the roll used and from which date) and the rows read vs kept.
+- A DBN trades download for the same root always wins; the CSV job is then
+  listed under `csv_jobs_not_used`.
+
+Without a continuous-series file for the root in the same raw folder,
+ingestion stops rather than estimate the roll.
+
 ## What ingestion does *not* do — all of it is cleaning
 
 No row of the requested contract is dropped, sorted, de-duplicated,

@@ -37,6 +37,11 @@ a download that is truncated or fails its job manifest's hash, files for one
 output from different datasets or different series (``NG.v.0`` mixed with
 ``NG.c.0``), mismatched column layouts, or a written file that fails the
 checks in ``verify_output``.
+
+Trades that arrived as a Databento CSV parent pull (NG and HG) are handled by
+``ingest_csv.py``: narrowed to the continuous series the contract's other
+files use, by Databento's own roll, and checked against its minute bars. A DBN
+trades download always takes precedence over a CSV one.
 """
 
 from __future__ import annotations
@@ -379,6 +384,12 @@ def list_raw(raw_dir: str, log=print) -> List[RawFile]:
     for mm in name_mismatches(files, raw_dir):
         log(f"\nWARNING: {mm['path']} is named for {mm['name_says']} but holds "
             f"{mm['header_says']}")
+    from ingest_csv import find_csv_jobs
+    for j in find_csv_jobs(raw_dir):
+        log(f"{','.join(j.roots) or '??':<8}{j.schema:<12}{','.join(j.symbols)[:15]:<16}"
+            f"{_ns_to_iso(j.start_ns)[:10]:<12}"
+            f"{_ns_to_iso(j.end_ns)[:10] if j.end_ns else '?':<12}csv  "
+            f"{len(j.files):>5} files  {os.path.relpath(j.folder, raw_dir)}/")
     return files
 
 
@@ -757,7 +768,9 @@ def ingest(symbol: str, raw_dir: str, out_dir: str, force: bool = False,
 
     batch = load_batch_manifests(raw_dir)
     plans = plan_outputs(files, symbol, batch=batch)
-    if not plans:
+    from ingest_csv import check_against_bars, plan_csv_trades, write_csv_trades
+    csv_plan, csv_not_used = plan_csv_trades(raw_dir, symbol, plans, batch, log=log)
+    if not plans and csv_plan is None:
         found = sorted({r for f in files for r in f.roots})
         raise IngestError(f"no raw file's metadata names root {symbol}; "
                           f"roots found: {found}")
@@ -772,9 +785,12 @@ def ingest(symbol: str, raw_dir: str, out_dir: str, force: bool = False,
         "files_for_other_roots": other_roots,
         "unidentified_files": [f.describe(raw_dir) for f in unidentified],
         "name_mismatches": mismatches,
+        "csv_jobs_not_used": csv_not_used,
     }
 
     targets = {kind: os.path.join(out_sym, f"{kind}.parquet") for kind in plans}
+    if csv_plan is not None:
+        targets[csv_plan.kind] = os.path.join(out_sym, f"{csv_plan.kind}.parquet")
     # A dry run applies the same checks, so it predicts the real run.
     if not force:
         exists = [p for p in targets.values() if os.path.exists(p)]
@@ -836,6 +852,44 @@ def ingest(symbol: str, raw_dir: str, out_dir: str, force: bool = False,
             entry["rows"] = rows
             entry["checks_passed"] = verify_output(tmp, kind, expected_rows=rows)
             log(f"  decoded {rows:,} rows; checks passed")
+
+        if csv_plan is not None:
+            job, cal = csv_plan.job, csv_plan.calendar
+            out_path = targets["trades"]
+            log(f"\ntrades: {len(job.files)} CSV file(s) of a {','.join(job.symbols)} "
+                f"pull, narrowed to {cal.series} by Databento's roll → {out_path}")
+            entry = {
+                "path": os.path.relpath(out_path, os.path.abspath(out_dir)),
+                "schema": "trades",
+                "dataset": job.dataset,
+                "stype_in": "continuous",
+                "series": [cal.series],
+                "converted_from_csv": {**job.describe(raw_dir),
+                                       "roll": cal.describe(raw_dir),
+                                       "rows_kept_if": "instrument_id is the one the "
+                                       "roll maps for the UTC date of ts_recv"},
+                "source_files": [],
+            }
+            manifest["outputs"]["trades"] = entry
+            if not dry_run:
+                os.makedirs(out_sym, exist_ok=True)
+                tmp = out_path + ".partial"
+                staged["trades"] = tmp
+                per_file, counts = write_csv_trades(csv_plan, tmp, chunk_rows=chunk_rows)
+                entry["source_files"] = [{**p, "path": os.path.relpath(p["path"], raw_dir)}
+                                         for p in per_file]
+                _flag_record_overlaps(entry, log)
+                entry.update(counts)
+                entry["rows"] = counts["rows_kept"]
+                checks = verify_output(tmp, "trades", expected_rows=entry["rows"])
+                if "ohlcv1m" in staged:
+                    checks.append(check_against_bars(tmp, staged["ohlcv1m"], cal.series))
+                else:
+                    log(f"  WARNING: no {symbol} minute bars in this run, so the "
+                        "converted trades were not checked against Databento's bars")
+                entry["checks_passed"] = checks
+                log(f"  kept {entry['rows']:,} of {counts['rows_read']:,} rows; "
+                    "checks passed")
 
         if not dry_run:
             man_path = os.path.join(out_sym, "ingest_manifest.json")
