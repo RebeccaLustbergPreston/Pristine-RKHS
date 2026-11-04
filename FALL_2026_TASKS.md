@@ -58,16 +58,18 @@ thing:
 Each step names what it waits on. Nothing is tuned against a score until
 step 7 has a score that tells real results from shuffled ones.
 
-1. **Loader** (piece C, C3). `DataLoader(symbol)` reads
-   `data/cleaned-master/<SYM>/` and exposes contract switches. Trading cost
-   per contract comes from tick value — see the correction in C3.
+1. **Loader** (piece C, C3) — **done 3 November** except wiring the cost
+   into P&L: `DataLoader(data_dir, symbol, source="cleaned")` reads
+   `data/cleaned-master/<SYM>/`, exposes contract switches, tick value and
+   `cost_per_trade()`. The pipeline still uses the flat `COST_PER_TRADE`.
 2. **Decide: predict hours or days** (`TODO.md` item 3). This sets what the
    bar size in step 5 has to achieve. Recommendation: a daily target, with
    bars used only to build the fast features — F1 and G both work on the
    daily calendar.
-3. **D0 on the new CL.** Re-run `validate_pipeline.py` on the cleaned
-   `CL.v.0` first, so the source change and the fix are measured separately.
-   The cleaning report lists all 18 switches with their price gaps.
+3. **D0 on the new CL — done 3 November.** Switch gaps removed from every
+   price change, forward only (`roll_gaps.py`; decision log entry 8).
+   Baseline and post-fix falsification runs are in the decision log: the
+   harness passes, and real features are no longer separable from noise.
 4. **D1**, `build_features_for_symbol`, with CL still on its fixed bar size
    so results match the step 3 baseline exactly.
 5. **D2**, bar size per contract by rule (waits on step 2).

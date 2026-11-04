@@ -13,7 +13,11 @@ done), and CL is now the cleaned `CL.v.0` tape rather than `CL.c.0`. See
 
 ---
 
-## 1. Remove the fake contract-switch moves from the CL target
+## 1. Remove the fake contract-switch moves from the CL target — done
+
+*Done 3 November 2026 by removing the gaps rather than dropping returns —
+see `docs/architecture_decisions.md` entry 8 for why and for the before/after
+falsification results.*
 
 **Small, and it sits under every number — do it first.**
 

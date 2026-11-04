@@ -182,7 +182,8 @@ results exactly.
 
 ## 8. Remove contract-switch gaps by chaining returns forward (D0)
 
-*3 November 2026 · Status: being implemented*
+*3 November 2026 · Status: in force · Code: `roll_gaps.py`, `data_loader.py`
+(`switch_gaps`), `SWITCH_GAPS` in `run_backtest.py`*
 
 **Decision.** At each change of contract in the continuous series, measure
 the gap between the old contract's last price and the new contract's first,
@@ -219,5 +220,29 @@ feature — so the adjustment here runs forward.
 VRP and MacroMotion inputs, VPIN's bar volatility and tick rule, and Kyle's
 price changes all see contract-consistent moves. Dollar-bar boundaries and
 costs are unchanged. Roll *costs* — the spread paid to roll a real position —
-are still not modelled; that is H3, a separate line. The pre-fix cleaned-CL
-falsification run is the baseline this is compared against.
+are still not modelled; that is H3, a separate line.
+
+**Measured.** On cleaned CL the 18 gaps sum to −11.6% over the window, 16 of
+them downward: the unadjusted series showed crude losing about 12% that no
+held position lost — a built-in downward drift under a momentum-directed
+strategy. Trades and 1-minute bars find the same 18 switches with identical
+gaps. Falsification suite, cleaned CL, Run 25 configuration, three seeds
+(Sharpe mean ± sd):
+
+| mode | gaps in | gaps removed |
+|---|---|---|
+| real features | 0.37 ± 0.33 | 0.36 ± 1.10 |
+| pure noise | −1.23 ± 0.69 | −0.31 ± 0.62 |
+| shuffled in time | 0.11 ± 0.73 | −0.71 ± 1.82 |
+| shuffled target | −0.46 ± 1.29 | −0.10 ± 1.95 |
+| leakage check (< 0.05) | 0.0468 | 0.0132 |
+
+The leakage margin is now comfortable. Before the fix, real features looked
+separable from noise (0.37 vs −1.23); after it they are not (0.36 vs −0.31).
+The noise run's strongly negative Sharpe was most likely the fake downward
+moves, not something the kernels added — so the one sign of kernel skill on
+the cleaned data was an artifact of the gaps. Stage-2 out-of-sample
+correlation is about zero in every mode either way. This is what step 7
+(a score that separates real from shuffled) is for; nothing should be tuned
+before it. Logs: `data/validate_cleaned_pre_D0.log`,
+`data/validate_cleaned_post_D0.log`.
