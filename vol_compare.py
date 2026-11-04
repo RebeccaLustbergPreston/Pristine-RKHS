@@ -2,10 +2,13 @@
 Do the kernels forecast volatility better than trailing volatility does?
 
     DATA_SOURCE=cleaned .venv/bin/python vol_compare.py --symbols all --reuse
+    DATA_SOURCE=cleaned .venv/bin/python vol_compare.py --target relvol --reuse
 
 Runs the pipeline in its volatility mode (TARGET_MODE=vol: the kernels are
 trained on log forward realised volatility) for each contract and seed, with
-the real target and with the target shuffled. Each run saves every kernel's
+the real target and with the target shuffled. --target relvol trains on
+forward volatility relative to trailing volatility instead (decision log
+entry 17); it is scored the same way. Each run saves every kernel's
 own out-of-sample forecast, scored by scoring.daily_vol_ic against what
 followed each session's close: next-day |return| and next-5-day realised vol.
 
@@ -48,18 +51,19 @@ def _source():
     return os.environ.get("DATA_SOURCE", "legacy").lower()
 
 
-def _logged(commit):
+def _logged(commit, target):
     done = {}
     if os.path.exists(RUN_LOG):
         with open(RUN_LOG) as fh:
             for line in fh:
                 r = json.loads(line)
-                if r["commit"] == commit and r["source"] == _source():
+                if (r["commit"] == commit and r["source"] == _source()
+                        and r.get("target", "vol") == target):
                     done[(r["symbol"], r["mode"], r["seed"])] = r
     return done
 
 
-def run_one(symbol, mode, seed, commit, done):
+def run_one(symbol, mode, seed, commit, done, target="vol"):
     key = (symbol, mode, seed)
     tag = f"{symbol:<4} mode={mode:<14} seed={seed}"
     if key in done:
@@ -67,7 +71,7 @@ def run_one(symbol, mode, seed, commit, done):
         return done[key]
     env = dict(os.environ)
     env.update(BASE_ENV)
-    env.update({"SYMBOL": symbol, "TARGET_MODE": "vol", "NULL_MODE": mode,
+    env.update({"SYMBOL": symbol, "TARGET_MODE": target, "NULL_MODE": mode,
                 "SEED": str(seed)})
     print(f"  [run]    {tag} ... ", end="", flush=True)
     p = subprocess.run([_PY, os.path.join(_ROOT, "run_backtest.py")], env=env,
@@ -80,7 +84,7 @@ def run_one(symbol, mode, seed, commit, done):
     d = np.load(os.path.join(_ROOT, m.group(1)), allow_pickle=True)
     scores = {str(n): dict(zip(COLS, map(float, row)))
               for n, row in zip(d["vol_score_names"], d["vol_scores"])}
-    r = {"symbol": symbol, "mode": mode, "seed": seed, "scores": scores,
+    r = {"symbol": symbol, "mode": mode, "seed": seed, "target": target, "scores": scores,
          "commit": commit, "source": _source()}
     with open(RUN_LOG, "a") as fh:
         fh.write(json.dumps(r) + "\n")
@@ -106,15 +110,16 @@ def main(argv=None):
     ap.add_argument("--seeds", type=int, default=3)
     ap.add_argument("--symbols", default="all")
     ap.add_argument("--reuse", action="store_true")
+    ap.add_argument("--target", choices=("vol", "relvol"), default="vol")
     a = ap.parse_args(argv)
     symbols = ALL_SYMBOLS if a.symbols == "all" else tuple(
         s.strip().upper() for s in a.symbols.split(","))
     commit = _commit()
-    done = _logged(commit) if a.reuse else {}
-    print(f"Volatility forecasts vs trailing volatility — data={_source()}, "
+    done = _logged(commit, a.target) if a.reuse else {}
+    print(f"Volatility forecasts vs trailing volatility — target={a.target}, data={_source()}, "
           f"contracts={','.join(symbols)}, {a.seeds} seed(s), commit {commit}\n")
     rows = [r for sym in symbols for m in MODES for s in range(a.seeds)
-            if (r := run_one(sym, m, s, commit, done)) is not None]
+            if (r := run_one(sym, m, s, commit, done, a.target)) is not None]
     names = sorted({n for r in rows for n in r["scores"]},
                    key=lambda n: (n == "combined", n))
 

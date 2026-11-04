@@ -1723,6 +1723,11 @@ def main():
         raise ValueError(f"TARGET_CLOCK={TARGET_CLOCK!r}; expected bar or day")
     TARGET_MODE = os.environ.get("TARGET_MODE", "returns").lower()
     VOL_WINDOW = int(os.environ.get("VOL_WINDOW", "20"))
+    # "relvol": forward volatility relative to trailing volatility (decision
+    # log entry 17), so a forecast scores only by what trailing vol misses.
+    VOL_TARGETS = ("vol", "relvol")
+    if TARGET_MODE not in ("returns",) + VOL_TARGETS:
+        raise ValueError(f"TARGET_MODE={TARGET_MODE!r}; expected returns, vol, relvol")
 
     bar_daily_idx = aligner.get_daily_indices(np.arange(n_fast))
     # Which day's daily *features* each bar may see (last completed day).
@@ -1732,7 +1737,7 @@ def main():
     # was correct, because many bars share a single day.
     bar_prices = master_px
 
-    if TARGET_MODE == "vol":
+    if TARGET_MODE in VOL_TARGETS:
         # ── Predict forward realized volatility ──
         # This is what RKHS kernels are actually good at (corr +0.062 vs +0.007 for returns)
         print(f"\n  Target: forward {VOL_WINDOW}-day realized vol (log-scaled)")
@@ -1749,6 +1754,15 @@ def main():
 
         # Log-scale vol (more normally distributed, better for regression)
         fwd_vol_daily = np.log(fwd_vol_daily + 1e-8)
+
+        if TARGET_MODE == "relvol":
+            # Minus log trailing vol over the VOL_WINDOW returns up to close d,
+            # the same baseline scoring.daily_vol_ic removes.
+            trail_vol_daily = np.full(len(cl_daily), np.nan)
+            for i in range(VOL_WINDOW, len(cl_daily)):
+                trail_vol_daily[i] = np.std(daily_log_ret[i - VOL_WINDOW:i]) * np.sqrt(252)
+            fwd_vol_daily = fwd_vol_daily - np.log(trail_vol_daily + 1e-8)
+            print(f"  Relative: minus log trailing {VOL_WINDOW}-day vol")
 
         # Map to bar resolution
         y = fwd_vol_daily[np.clip(bar_daily_idx, 0, len(fwd_vol_daily) - 1)]
@@ -1803,7 +1817,7 @@ def main():
 
     # When each bar's label becomes known (the bar at whose close it is
     # realised), so training rows that would see into a test fold are purged.
-    if TARGET_MODE == "vol":
+    if TARGET_MODE in VOL_TARGETS:
         _lab_day = np.minimum(bar_daily_idx + VOL_WINDOW, n_slow - 1)
         label_end = np.searchsorted(bar_daily_idx, _lab_day, side="right") - 1
     elif FORWARD_HORIZON == 1 and TARGET_CLOCK == "bar":
@@ -2421,7 +2435,7 @@ def main():
     # ── Warm-up filter: stay flat for first WARMUP_DAYS ──
     WARMUP_DAYS = int(os.environ.get("WARMUP_DAYS", "120"))
 
-    if TARGET_MODE == "vol":
+    if TARGET_MODE in VOL_TARGETS:
         # ── Vol regime trading ──────────────────────────────────────────
         # s-score now measures deviation from "normal" vol:
         #   s < 0 → vol below normal (compressed) → favorable for trending
@@ -2543,7 +2557,7 @@ def main():
     # This leverages what RKHS is good at (vol prediction) while keeping
     # return-prediction Kalman for entry/exit timing.
     VOL_SIZING = os.environ.get("VOL_SIZING", "0") == "1"
-    if VOL_SIZING and TARGET_MODE != "vol":
+    if VOL_SIZING and TARGET_MODE not in VOL_TARGETS:
         print(f"\n  Hybrid vol-sizing: computing realized vol target...")
 
         # Compute forward realized vol (same as vol target mode)
@@ -2708,7 +2722,7 @@ def main():
     print(f"    Net P&L:          {daily_strat_returns.sum():.6f}")
 
     # Also keep bar-level for charting compatibility
-    if TARGET_MODE == "vol" and y_returns_bar is not None:
+    if TARGET_MODE in VOL_TARGETS and y_returns_bar is not None:
         # In vol mode, y_true is vol not returns — use actual returns for P&L
         bar_ret = y_returns_bar[:len(positions)]
         strat_returns_bar = positions[:-1] * bar_ret[1:]
