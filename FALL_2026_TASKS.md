@@ -85,7 +85,9 @@ step 7 has a score that tells real results from shuffled ones.
 7. **E0, then E1 and E3.** E3 passing is the gate for everything after it.
 8. **H2, H3.** H2 is mostly in hand: each ingestion manifest records which
    contract Databento's roll held on every date.
-9. **F**, then **G**, then **I**.
+9. **F**, then **G**, then **I**. *4 November: F1 is next — see the F1
+   plan in section F. D2 and depth features wait; with no per-contract skill
+   they would be tuning a model that has nothing to tune.*
 
 ---
 
@@ -339,6 +341,41 @@ is actually built for, and it is what the interaction thesis needs.
 depth exists for only four of the eight, and a ranking where half the contracts
 carry an extra feature partly reflects which data we bought rather than what the
 markets did. The LOB question gets its own controlled test in G8.
+
+**F1 plan (4 November, after decision log entries 11, 16, 17).** The
+kernels have shown no skill on any per-contract target, so F1 is built so
+that it is useful whether or not they ever do:
+
+1. *One cross-sectional score.* Each session, rank the eight contracts by a
+   forecast and score it by the Spearman correlation with the next session's
+   returns across the eight (ranks, so ES and NG are comparable). Average over
+   sessions; s.e. from the spread over sessions. Null: shuffle which contract
+   each forecast belongs to, per session. Lives in `scoring.py` beside
+   `daily_ic`, with tests.
+2. *Baselines first, as rules (like E0).* 12-month, 3-month and 1-month
+   momentum (only ~18 months of history, so 12-month is short-lived; 1- and
+   3-month are the main ones), and carry. These are the floor the kernels
+   must beat, and G1 in the ablation.
+3. *Carry, free.* All bar and statistics pulls are front-month only
+   (`.v.0`/`.n.0`/`.c.0`), so there is no second-month price — except NG
+   and HG, whose trades came as parent pulls with every contract. The
+   switch gaps already measured by `roll_gaps.switch_table` (log new front
+   ÷ old front at each roll) are the term-structure slope at that date: a
+   carry signal known from the roll onward, updated each roll. Use that for
+   all eight; check it against true front-vs-second carry on NG and HG. A
+   proper daily carry would need second-month `statistics` (settlement
+   prices) — cheap, but a new purchase, so ask first.
+4. *Then the kernels.* Train on the cross-sectional rank target with the
+   shared features only (VPIN, Kyle, Hawkes, VRP, Macro; no LOB). Score with
+   the same cross-sectional IC against the shuffled null and against the
+   momentum/carry rules. Separately, F2: momentum/carry for direction,
+   kernels only for sizing, against plain inverse-trailing-vol sizing.
+
+*Stopping rule, fixed now:* a forecast counts only if its pooled
+cross-sectional IC is at least 2 s.e. above its shuffled null on the fixed
+next-day target. With ~300 scored sessions × 8 contracts the no-skill s.e.
+is roughly 1/sqrt(300·7) ≈ ±0.02 per session-average, so an IC of ~0.05 is
+detectable; published cross-sectional momentum ICs are around that size.
 
 **F2. Split direction from sizing.** Direction from a plain trend signal
 per market — this is a commodity and nobody has an edge in it. Size from
