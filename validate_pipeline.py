@@ -75,6 +75,8 @@ def results_path(mode: str, seed: int) -> str:
     lag = int(os.environ.get("SLOW_FEATURE_LAG", "1"))
     if lag != 1:
         label += f"_slowlag{lag}"
+    if os.environ.get("GATE_FIT", "walkforward").lower() == "fullsample":
+        label += "_gatefull"
     if mode != "none":
         label += f"_null-{mode}"
     if seed != 0:

@@ -57,6 +57,20 @@ SWITCH_GAPS = os.environ.get("SWITCH_GAPS", "remove").lower()
 # 2026, tagged "_slowlag0". docs/architecture_decisions.md entry 10.
 SLOW_FEATURE_LAG = int(os.environ.get("SLOW_FEATURE_LAG", "1"))
 
+# Momentum regime gate (decision log entry 12). "walkforward": each day's gate
+# from a model fitted only on returns already known, mapped to bars by date.
+# "fullsample" reproduces runs before November 2026: one fit on every day's
+# next return, stretched over the out-of-sample bars by row position.
+# Those results carry "_gatefull".
+GATE_FIT = os.environ.get("GATE_FIT", "walkforward").lower()
+
+# E0 controls (FALL_2026_TASKS.md E0; decision log entry 13). Replace the
+# kernels' out-of-sample predictions with a one-line rule and change nothing
+# else. "trend": trailing 28-calendar-day return on the bar clock (returns
+# target). "trailing_vol": log realised vol of the last 20 completed sessions
+# (TARGET_MODE=vol). Results carry "_pred-<source>".
+PRED_SOURCE = os.environ.get("PRED_SOURCE", "kernels").lower()
+
 
 def _seed(base: int) -> int:
     return base + _SEED_OFFSET
@@ -1513,16 +1527,22 @@ def main():
     print("\n  Fitting MomentumGate (Arjan)...")
     cl_daily = daily_close[:n_slow]
     mg = MomentumGate(short_window=20, long_window=60, vol_window=20,
-                      n_rff=256, random_state=_seed(42))
+                      n_rff=256, random_state=_seed(42),
+                      causal_features=(GATE_FIT == "walkforward"))
     lookback = max(mg.long_window, mg.vol_window)
     if len(cl_daily) > lookback + 10:
         log_r = np.diff(np.log(cl_daily))
         M_gate = len(cl_daily) - 1 - lookback
         target_gate = log_r[lookback:lookback + M_gate]
         mg.fit(cl_daily[:lookback + M_gate + 1], target_gate)
-        gate_vals = mg.gate_values(cl_daily[:lookback + M_gate + 1])
-        print(f"  Gate range: [{gate_vals.min():.4f}, {gate_vals.max():.4f}], "
-              f"mean: {gate_vals.mean():.4f}")
+        if GATE_FIT == "walkforward":
+            gate_vals = mg.gate_values_walk_forward(cl_daily)
+            print(f"  Gate fitted walk-forward; {np.isnan(gate_vals).sum()} early "
+                  f"days without enough history are ungated")
+        else:
+            gate_vals = mg.gate_values(cl_daily[:lookback + M_gate + 1])
+        print(f"  Gate range: [{np.nanmin(gate_vals):.4f}, {np.nanmax(gate_vals):.4f}], "
+              f"mean: {np.nanmean(gate_vals):.4f}")
     else:
         mg = None
         print("  Skipped (not enough daily data)")
@@ -1538,6 +1558,7 @@ def main():
         momentum_gate=mg,
         daily_prices=cl_daily if mg else None,
         seed=_seed(42),
+        gate_rows=gate_vals if (mg is not None and GATE_FIT == "walkforward") else None,
     )
 
     # ── 6. Walk-forward backtest ─────────────────────────────────────────
@@ -1766,6 +1787,7 @@ def main():
         momentum_gate=mg,
         daily_prices=cl_daily if mg else None,
         seed=_seed(42),
+        gate_rows=gate_vals if (mg is not None and GATE_FIT == "walkforward") else None,
     )
 
     _tqdm_bar = None
@@ -2097,6 +2119,27 @@ def main():
         result.y_true_oos = result_true_for_signal
         result.oos_indices = stage2_valid_idx
 
+    if PRED_SOURCE != "kernels":
+        _b = np.asarray(result.oos_indices)[:len(result.y_pred_oos)]
+        if PRED_SOURCE == "trend":
+            _lp = np.log(bar_prices + 1e-8)
+            _j = np.searchsorted(bar_timestamps, bar_timestamps - 28 * 86400.0, side="left")
+            _rule = _lp - _lp[_j]
+        elif PRED_SOURCE == "trailing_vol":
+            _dr = np.diff(np.log(cl_daily + 1e-8))
+            _rv = np.full(len(cl_daily), np.nan)
+            for _d in range(21, len(cl_daily)):
+                _rv[_d] = np.std(_dr[_d - 20:_d]) * np.sqrt(252)   # returns up to close d
+            _rv = np.log(_rv + 1e-8)
+            _rule = _rv[bar_feature_day_idx]                      # last completed day
+            _rule = np.where(np.isfinite(_rule), _rule, np.nanmean(_rule))
+        else:
+            raise ValueError(f"PRED_SOURCE={PRED_SOURCE!r}; expected kernels, trend, "
+                             "trailing_vol")
+        result.y_pred_oos = _rule[_b].astype(float)
+        print(f"\n  E0 CONTROL: predictions replaced by {PRED_SOURCE} — the kernels "
+              "are not used from here on")
+
     # ── 8. Signal generation + performance metrics ───────────────────────
     SIGNAL_MODE = os.environ.get("SIGNAL_MODE", "ou").lower()
     ADAPTIVE_Q = os.environ.get("ADAPTIVE_Q", "0") == "1"
@@ -2204,12 +2247,22 @@ def main():
     # Build regime gate for adaptive thresholds (improvement #2)
     regime_gate = None
     if mg is not None and len(cl_daily) > lookback + 10:
-        # Align gate values from daily resolution to OOS bar resolution
-        raw_gate = mg.gate_values(cl_daily[:lookback + M_gate + 1])
-        # Expand to bar resolution
         n_oos = len(pred)
-        gate_daily_idx = np.linspace(0, len(raw_gate) - 1, n_oos).astype(int)
-        regime_gate = raw_gate[gate_daily_idx]
+        if GATE_FIT == "walkforward":
+            # Each OOS bar gets the gate of its last completed day; a day too
+            # early to have a gate counts as choppy (the stricter thresholds).
+            _g_day = aligner.get_feature_day_indices(
+                np.asarray(result.oos_indices)[:n_oos]) - lookback
+            _ok = (_g_day >= 0) & (_g_day < len(gate_vals))
+            regime_gate = np.zeros(n_oos)
+            regime_gate[_ok] = gate_vals[_g_day[_ok]]
+            regime_gate = np.nan_to_num(regime_gate, nan=0.0)
+        else:
+            # Pre-November 2026: one full-sample fit, stretched over the OOS
+            # bars by row position (np.linspace), not by date.
+            raw_gate = mg.gate_values(cl_daily[:lookback + M_gate + 1])
+            gate_daily_idx = np.linspace(0, len(raw_gate) - 1, n_oos).astype(int)
+            regime_gate = raw_gate[gate_daily_idx]
         print(f"  Regime gate: mean={regime_gate.mean():.3f} "
               f"[{regime_gate.min():.3f}, {regime_gate.max():.3f}]")
         print(f"  Trending bars: {(regime_gate > 0.5).sum()} "
@@ -2566,7 +2619,10 @@ def main():
     src_tag = "" if DATA_SOURCE == "legacy" else f"_src-{DATA_SOURCE}"
     gaps_tag = "_gaps-kept" if SWITCH_GAPS == "keep" else ""
     lag_tag = "" if SLOW_FEATURE_LAG == 1 else f"_slowlag{SLOW_FEATURE_LAG}"
-    run_label = f"{run_label}{src_tag}{gaps_tag}{lag_tag}{null_tag}{seed_tag}"
+    gate_tag = "_gatefull" if GATE_FIT == "fullsample" else ""
+    pred_tag = "" if PRED_SOURCE == "kernels" else f"_pred-{PRED_SOURCE}"
+    run_label = (f"{run_label}{src_tag}{gaps_tag}{lag_tag}{gate_tag}{pred_tag}"
+                 f"{null_tag}{seed_tag}")
     results_file = os.path.join(_ROOT, f"backtest_results_{run_label}.npz")
     np.savez(
         results_file,

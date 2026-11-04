@@ -45,7 +45,8 @@ from typing import Optional
 def momentum_features(prices: np.ndarray,
                       short_window: int = 20,
                       long_window: int = 60,
-                      vol_window: int = 20) -> np.ndarray:
+                      vol_window: int = 20,
+                      causal: bool = True) -> np.ndarray:
     """
     Build a (M, 3) standardised momentum feature matrix.
 
@@ -62,6 +63,14 @@ def momentum_features(prices: np.ndarray,
         M = N - 1 - max(long_window, vol_window)
         Rows aligned so features[t] uses data up to and including
         log_returns[t + lookback - 1]  (no lookahead).
+
+    causal : True (default) makes that statement true. The original version,
+        kept for reproducing earlier runs with causal=False, broke it twice:
+        ema_cross read the EMAs at log_returns[t + lookback] — the very return
+        the gate is fitted to predict — and the three features were
+        standardised with whole-sample mean and std (bug 5 in POSTMORTEM.md).
+        Causal: EMAs at the row's last known return, expanding z-score.
+        docs/architecture_decisions.md entry 12.
     """
     prices = np.asarray(prices, dtype=float)
     log_r = np.diff(np.log(prices))           # length N-1
@@ -95,9 +104,13 @@ def momentum_features(prices: np.ndarray,
         tsmom[i]      = log_r[t - long_window: t].sum()
         rv             = log_r[t - vol_window: t].std()
         vol_scaled[i]  = tsmom[i] / (rv + 1e-8)
-        ema_cross[i]   = ema_s[t] / (ema_l[t] + 1e-8) - 1.0
+        k = t - 1 if causal else t          # last return known on the row's day
+        ema_cross[i]   = ema_s[k] / (ema_l[k] + 1e-8) - 1.0
 
     feats = np.column_stack([tsmom, vol_scaled, ema_cross])
+    if causal:
+        from feature_alignment import expanding_zscore
+        return expanding_zscore(feats)
     mu, sigma = feats.mean(axis=0), feats.std(axis=0) + 1e-8
     return (feats - mu) / sigma
 
@@ -159,7 +172,8 @@ class MomentumGate:
 
     def __init__(self, short_window=20, long_window=60, vol_window=20,
                  nu=1.5, length_scale=1.0, n_rff=256,
-                 reg_lambda=1e-3, random_state=42):
+                 reg_lambda=1e-3, random_state=42, causal_features=True):
+        self.causal_features = causal_features
         self.short_window  = short_window
         self.long_window   = long_window
         self.vol_window    = vol_window
@@ -172,7 +186,8 @@ class MomentumGate:
 
     def _feats(self, prices):
         return momentum_features(prices, self.short_window,
-                                 self.long_window, self.vol_window)
+                                 self.long_window, self.vol_window,
+                                 causal=self.causal_features)
 
     def fit(self, prices: np.ndarray, target_returns: np.ndarray):
         """
@@ -212,6 +227,36 @@ class MomentumGate:
         assert self._fitted, "Call fit() before gate_values()"
         Phi = self._rff.transform(self._feats(prices))
         return 1.0 / (1.0 + np.exp(-Phi @ self._w))
+
+    def gate_values_walk_forward(self, prices: np.ndarray,
+                                 min_train: int = 60) -> np.ndarray:
+        """
+        Gate for every feature row, each from a model fitted only on what was
+        known that day. Row m describes day d = m + lookback (prices up to
+        and including d); its training target, the return from d to d+1, is
+        known at the end of day d+1. So row m's gate is fitted on rows
+        j <= m - 1 and nothing later. Rows with fewer than ``min_train``
+        earlier rows are NaN.
+
+        ``fit`` + ``gate_values`` on the whole series, the original use,
+        scores every day with a model that has seen that day's next return —
+        an in-sample forecast of tomorrow. See docs/architecture_decisions.md
+        entry 12.
+
+        Returns gate, shape (M,), aligned like gate_values.
+        """
+        feats = self._feats(prices)
+        Phi = self._rff.transform(feats)
+        log_r = np.diff(np.log(np.asarray(prices, dtype=float)))
+        lookback = max(self.long_window, self.vol_window)
+        y = log_r[lookback:lookback + len(Phi)]          # next-day return per row
+        out = np.full(len(Phi), np.nan)
+        D = Phi.shape[1]
+        for m in range(min_train, len(Phi)):
+            P, t = Phi[:m], y[:m]                          # rows j < m only
+            w = np.linalg.solve(P.T @ P + self.reg_lambda * np.eye(D), P.T @ t)
+            out[m] = 1.0 / (1.0 + np.exp(-Phi[m] @ w))
+        return out
 
     def optimize(self, prices: np.ndarray, target_returns: np.ndarray,
                  verbose: bool = True) -> dict:

@@ -296,6 +296,10 @@ one number, and the spread across seeds is larger than any effect we would
 be looking for.
 
 **E0. Check whether the kernels are doing the work at all — cheap, do first.**
+*Correction (3 November): the mechanism described below is the
+`TARGET_MODE=vol` path. Run 25 is the returns path, where the kernels' return
+predictions do choose direction. E0 now runs in both — `run_e0.py`, decision
+log entry 13.*
 The position rule is: enter when the kernel volatility forecast says volatility
 is compressed, take direction from 20-day momentum, exit when volatility
 expands, size by inverse predicted volatility. The kernels therefore gate and

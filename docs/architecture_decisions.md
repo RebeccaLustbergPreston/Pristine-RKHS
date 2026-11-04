@@ -368,3 +368,105 @@ Neither separates from its null — as the power calculation predicted. On CL
 alone the choice cannot be made from results. In several folds the combiner
 gives every kernel zero weight, so the prediction is constant there and the
 fold has no IC. Log: `data/compare_targets_CL.log`.
+
+---
+
+## 12. The momentum regime gate is fitted walk-forward on causal features
+
+*3 November 2026 · Status: in force (`GATE_FIT=walkforward`, the default) ·
+Code: `MomentumGate.gate_values_walk_forward`, `momentum_features(causal=)`*
+
+**Decision.** Each day's gate comes from a model fitted only on returns
+already known that day; its three momentum features use only returns up to
+the row's own day and are standardised by expanding z-score; the gate
+reaches out-of-sample bars by date (last completed day), not by row
+position.
+
+**Context.** The gate (a kernel ridge regression from momentum features to
+next-day return, squashed to (0, 1)) sets the entry and exit thresholds —
+trending or choppy — and attenuates the slow kernels in the combiner. Four
+things were wrong with it, all present in the legacy pipeline:
+
+1. **Fitted once on every day** — including every out-of-sample day — so
+   each day's gate was an in-sample forecast of its own next return.
+2. **The target was inside a feature.** `ema_cross` read the EMAs at
+   `log_r[t]`, the return the gate is fitted to predict.
+3. **Whole-sample standardisation** of the features (`feats.mean(axis=0)`),
+   which is bug 5 in `POSTMORTEM.md`.
+4. **Stretched by row position**: in position generation the daily gate was
+   spread over the out-of-sample bars with `np.linspace`, breaking invariant
+   1 in `CLAUDE.md` and pairing bars with the wrong days.
+
+**Evidence.** Rank correlation of the gate with the next day's CL return on
+cleaned data: **0.349** fitted on the full sample (it called "trending" on
+50% of up days and 28% of down days), **0.017** fitted walk-forward. Without
+the leak the gate barely moves (0.477–0.512 on cleaned CL). None of this was
+visible to the falsification suite: the gate is always fitted on the real
+returns, so shuffling the target does not touch it.
+
+**Downstream impact.** Every result before this entry had a regime gate
+that knew tomorrow's direction. `GATE_FIT=fullsample` reproduces those runs
+(original features and fit, results tagged `_gatefull`).
+`test_momentum_gate.py` pins that changing future prices cannot change an
+earlier gate.
+
+---
+
+## 13. E0 tests the configuration we actually run, and the one it was written for
+
+*3 November 2026 · Status: done on CL · Code: `PRED_SOURCE`, `run_e0.py`*
+
+**Decision.** Run E0 in both of the pipeline's position paths.
+
+**Context.** E0 was written from a reading of the volatility path
+(`TARGET_MODE=vol`): kernels forecast volatility, direction from 20-day
+momentum. The configuration every reported number and the falsification
+suite use — Run 25 — is the *returns* path: the Kalman-filtered kernel
+return predictions set direction and timing, the regime gate sets
+thresholds, and size comes from trailing realised volatility, not from the
+kernels. So "kernels gate and size, never choose direction" (`HANDOFF.md`,
+`FALL_2026_TASKS.md` E0) is true of the volatility path only.
+
+**The controls.** Replace the kernels' out-of-sample predictions and change
+nothing else: in the returns path, by the trailing 28-calendar-day return
+(`PRED_SOURCE=trend` — the "trend alone" floor of ablation row G1); in the
+volatility path, by trailing 20-session realised volatility
+(`PRED_SOURCE=trailing_vol` — E0 as written).
+
+**Result** (cleaned CL, all fixes in, Run 25 configuration, three seeds;
+mean ± sd; the rule controls are deterministic, so their spread is zero):
+
+| path | prediction | Sharpe | daily IC | active days |
+|---|---|---|---|---|
+| returns (Run 25) | kernels | 0.76 ± 0.16 | −0.040 ± 0.063 | 29 |
+| returns (Run 25) | trend rule | −0.03 | −0.136 | 63 |
+| volatility | kernels | 0.51 ± 0.57 | +0.047 ± 0.021 | 25 |
+| volatility | trailing vol | 0.39 | +0.033 | 50 |
+
+What it means, read with the stage-2 weights saved in each run:
+
+- **Returns path: the Sharpe is not coming from the kernels.** The
+  ElasticNet combiner gives every kernel a weight of exactly zero on seed 0
+  and at most 0.04 on seeds 1 and 2, so the "prediction" is mostly the
+  combiner's fitted intercept — 38 distinct values over 2,505 bars on seed 0,
+  a slow step function of past mean returns. Seed 0 earns Sharpe 0.56 with
+  every kernel switched off. The trend rule scores worse, but it is a
+  different signal, not the kernels-off version of this one. The predictions
+  have no daily skill (IC about zero or negative).
+- **The regime gate does not move positions in this configuration.** Walk-
+  forward and full-sample gates classify 61% and 50% of bars as trending but
+  give identical positions and identical results, which is why fixing its
+  lookahead (entry 12) left the falsification numbers unchanged.
+- **Volatility path: the kernels are not distinguishable from trailing
+  volatility.** 0.51 ± 0.57 against 0.39, daily IC 0.047 against 0.033. Here
+  OrderFlow does get weight (0.18–0.21 on every seed) — the only kernel that
+  does anywhere.
+
+**Downstream impact.** On CL, no kernel has shown measurable value in either
+path. That is what the project's thesis predicts for one contract
+(`HANDOFF.md`: the value should be in ranking across markets), and one
+contract cannot settle it statistically. The next test of the idea is D1
+(all eight contracts) and F1 (the cross-sectional target). A permanent
+"kernels off" control — predictions replaced by the combiner's intercept —
+would make this check routine in `validate_pipeline.py`. Logs:
+`data/validate_cleaned_gatewf.log`, `data/e0_CL.log`.

@@ -253,6 +253,7 @@ class TwoLevelKernelCombiner:
         momentum_gate=None,
         daily_prices: Optional[np.ndarray] = None,
         seed: int = 42,
+        gate_rows: Optional[np.ndarray] = None,
     ):
         self.fast_layer = fast_layer
         self.slow_layer = slow_layer
@@ -262,6 +263,10 @@ class TwoLevelKernelCombiner:
         self.event_gate = event_gate
         self.momentum_gate = momentum_gate
         self.daily_prices = daily_prices
+        # Precomputed gate per feature row (e.g. MomentumGate.
+        # gate_values_walk_forward); used instead of momentum_gate.gate_values
+        # when given. NaN rows leave the slow features ungated.
+        self.gate_rows = gate_rows
         self._rng = np.random.RandomState(seed)
         self._sketch_initialized = False
 
@@ -356,14 +361,15 @@ class TwoLevelKernelCombiner:
                 and self.daily_prices is not None
                 and getattr(self.momentum_gate, '_fitted', False)):
             daily_idx = self.aligner.get_feature_day_indices(bar_indices)
-            gate_daily = self.momentum_gate.gate_values(self.daily_prices)
+            gate_daily = (self.gate_rows if self.gate_rows is not None
+                          else self.momentum_gate.gate_values(self.daily_prices))
             # Map daily gate values to bar resolution
             lookback = max(self.momentum_gate.long_window,
                            self.momentum_gate.vol_window)
             gate_at_bars = np.ones(len(bar_indices))
             for i, di in enumerate(daily_idx):
                 gi = di - lookback
-                if 0 <= gi < len(gate_daily):
+                if 0 <= gi < len(gate_daily) and np.isfinite(gate_daily[gi]):
                     gate_at_bars[i] = gate_daily[gi]
             phi_slow = phi_slow * np.sqrt(gate_at_bars)[:, np.newaxis]
 
