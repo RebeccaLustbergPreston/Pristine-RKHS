@@ -328,7 +328,7 @@ too few to lean on; `TODO.md` item 7 asks for ten. Logs:
 
 ## 11. Choosing between next-bar and next-day targets by test, not by Sharpe
 
-*3 November 2026 · Status: test built; decision pending pooled data · Code:
+*3 November 2026, pooled 4 November · Status: tested — the data cannot choose; decide on design · Code:
 `TARGET_CLOCK`, `scoring.py`, `compare_targets.py`*
 
 **Decision.** Add a true next-day target (`TARGET_CLOCK=day`: the return 24
@@ -368,6 +368,22 @@ Neither separates from its null — as the power calculation predicted. On CL
 alone the choice cannot be made from results. In several folds the combiner
 gives every kernel zero weight, so the prediction is constant there and the
 fold has no IC. Log: `data/compare_targets_CL.log`.
+
+**Pooled over all eight contracts** (commit `ebcb539`, purged, three seeds,
+96 runs, 1,356 scored contract-days, no-skill s.e. ±0.027):
+
+| training target | daily IC, real | daily IC, shuffled target | gap ÷ s.e. |
+|---|---|---|---|
+| next bar | −0.044 ± 0.012 | +0.005 ± 0.010 | −1.24 |
+| next day | −0.044 ± 0.019 | +0.016 ± 0.032 | −1.35 |
+
+Neither target separates from its null, and the two are the same to three
+decimals. Both sit slightly *below* their nulls; at about 1.3 s.e. that is
+not evidence of anything. No contract shows a consistent positive IC under
+both targets. The results cannot choose the target, so it is chosen on
+design: the position is held overnight and graded on the next session's
+return, which is what the next-day target trains on. Log:
+`data/compare_targets_pooled.log`; runs in `data/compare_targets_runs.jsonl`.
 
 ---
 
@@ -579,7 +595,7 @@ outcome ("beyond trailing"). Compare with the shuffled-target null, pooled
 across contracts.
 
 **Why.** Volatility is persistent: trailing volatility alone forecasts the
-next five days with a rank IC around 0.5. Any forecast that tracks it scores
+next five days well (pooled rank IC +0.19 here). Any forecast that tracks it scores
 well, so the plain IC cannot say whether a kernel knows anything. "Beyond
 trailing" can. Short, non-overlapping outcome windows keep the score from
 looking more certain than it is.
@@ -587,3 +603,38 @@ looking more certain than it is.
 **Context.** The project documents describe the kernels as volatility
 forecasters, but every reported run used the returns target (entry 13).
 This is the first test of the kernels on the job they were built for.
+
+**Pooled result** (commit `ebcb539` with the no-trade print fix, all eight
+contracts, three seeds, 48 runs; Sentiment and VannaCharm exist on CL only):
+
+| forecast | IC, next-5-day vol | beyond trailing | shuffled-null beyond | gap ÷ s.e. |
+|---|---|---|---|---|
+| Macro | +0.016 | +0.017 | +0.013 | 0.08 |
+| OrderFlow | +0.016 | −0.012 | −0.002 | −0.30 |
+| VRP | −0.019 | −0.023 | −0.023 | 0.01 |
+| Sentiment (CL) | −0.107 | −0.050 | −0.033 | −0.14 |
+| VannaCharm (CL) | −0.082 | −0.090 | −0.080 | −0.09 |
+| combined | −0.095 | −0.130 | +0.061 | −4.35 |
+| trailing 20-day vol | +0.188 | — | — | — |
+
+No kernel adds volatility information beyond trailing volatility: every
+"beyond trailing" score is within a fraction of a standard error of its
+null. Next-day |return| tells the same story. Plain trailing volatility
+beats every kernel and the combination.
+
+The combination's −4.35 is real but is not the kernels. The stage-2
+ElasticNet gives every kernel zero or near-zero weight on most contracts, so
+the combined forecast is mostly its intercept: the mean realised volatility
+of each fold's training window. That is a stale volatility level that steps
+once per fold. Over 18 months in which volatility regimes drift, the old
+level points the wrong way once trailing volatility is removed. With a
+shuffled target the intercept is the same everywhere, so the null sits near
+zero. The finding is that the intercept is a bad forecast, not that the
+kernels forecast backwards.
+
+**Downstream.** The volatility framing does not rescue the kernels on this
+data. Any later volatility model must beat trailing volatility, not zero,
+and should forecast relative to it (for example, the log of future
+volatility over trailing volatility), so a stale intercept cannot score.
+Log: `data/vol_compare_pooled.log`; runs in `data/vol_compare_runs.jsonl`.
+

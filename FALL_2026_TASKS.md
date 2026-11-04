@@ -13,7 +13,7 @@ author can run it from a clean clone and get the same answer.
 
 ---
 
-## Where things stand — 3 November 2026
+## Where things stand — 4 November 2026
 
 Sections A, B and C1–C2 below are overtaken by events and kept for the
 record. Read this first.
@@ -62,12 +62,14 @@ step 7 has a score that tells real results from shuffled ones.
    into P&L: `DataLoader(data_dir, symbol, source="cleaned")` reads
    `data/cleaned-master/<SYM>/`, exposes contract switches, tick value and
    `cost_per_trade()`. The pipeline still uses the flat `COST_PER_TRADE`.
-2. **Decide: predict hours or days** (`TODO.md` item 3). *Test built
-   (`compare_targets.py`, decision log entry 11); on CL alone neither target
-   separates from noise, so the binding run waits for D1.* This sets what the
-   bar size in step 5 has to achieve. Recommendation: a daily target, with
-   bars used only to build the fast features — F1 and G both work on the
-   daily calendar.
+2. **Decide: predict hours or days** (`TODO.md` item 3). *Pooled run done
+   4 November (decision log entry 11): over all eight contracts neither
+   target separates from its shuffled null (−1.2 and −1.4 s.e.), and they
+   score the same. The data cannot choose, so choose on design:* a daily
+   target, with bars used only to build the fast features — the position is
+   held overnight, and F1 and G both work on the daily calendar.
+   **Volatility mode checked too (entry 16):** no kernel forecasts volatility
+   beyond trailing 20-day volatility on any of the eight contracts.
 3. **D0 on the new CL — done 3 November.** Switch gaps removed from every
    price change, forward only (`roll_gaps.py`; decision log entry 8).
    Baseline and post-fix falsification runs are in the decision log: the

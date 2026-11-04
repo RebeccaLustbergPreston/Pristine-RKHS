@@ -2744,7 +2744,7 @@ def main():
     else:
         hit_rate = 0
         n_wins = n_losses = n_flat = 0
-        win_loss_ratio = 0
+        avg_win, avg_loss, win_loss_ratio = 0, 0, 0
 
     print(f"\n  Strategy Performance (daily resolution):")
     print(f"    Sharpe Ratio:     {sr:.4f}")

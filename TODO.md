@@ -11,6 +11,10 @@ Background for all of it is in `POSTMORTEM.md` (what was broken) and
 done), and CL is now the cleaned `CL.v.0` tape rather than `CL.c.0`. See
 "Where things stand" in `FALL_2026_TASKS.md`.
 
+**4 November 2026:** pooled over all eight contracts, neither the next-bar nor
+the next-day target beats a shuffled target, and no kernel forecasts
+volatility beyond trailing volatility (decision log entries 11 and 16).
+
 ---
 
 ## 1. Remove the fake contract-switch moves from the CL target — done
