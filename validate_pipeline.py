@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 
@@ -77,6 +78,10 @@ def results_path(mode: str, seed: int) -> str:
         label += f"_slowlag{lag}"
     if os.environ.get("GATE_FIT", "walkforward").lower() == "fullsample":
         label += "_gatefull"
+    sym = os.environ.get("SYMBOL", "CL").upper()
+    if sym != "CL":   # --reuse finds non-CL runs only if the kernel count matches
+        label = label.replace("2fast_3slow", "1fast_2slow", 1)
+        label = label.replace("_src-", f"_sym-{sym}_src-", 1)
     if mode != "none":
         label += f"_null-{mode}"
     if seed != 0:
@@ -104,6 +109,11 @@ def run_one(mode: str, seed: int, reuse: bool) -> dict | None:
             print(f"    exit {proc.returncode}\n{tail}")
             return None
         print("ok")
+        # The run names its own file; the label depends on which kernels the
+        # contract has (e.g. "1fast_2slow" without VannaCharm and Sentiment).
+        m = re.search(r"Results saved to (\S+\.npz)", proc.stdout)
+        if m:
+            path = os.path.join(_ROOT, m.group(1))
 
     if not os.path.exists(path):
         print(f"    expected {os.path.basename(path)}, not found")

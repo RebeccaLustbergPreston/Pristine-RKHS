@@ -72,8 +72,9 @@ step 7 has a score that tells real results from shuffled ones.
    price change, forward only (`roll_gaps.py`; decision log entry 8).
    Baseline and post-fix falsification runs are in the decision log: the
    harness passes, and real features are no longer separable from noise.
-4. **D1**, `build_features_for_symbol`, with CL still on its fixed bar size
-   so results match the step 3 baseline exactly.
+4. **D1 — done 3 November.** `build_features_for_symbol(symbol)`; CL
+   reproduces the pre-refactor runs exactly (41 arrays, two seeds); all eight
+   contracts run end to end (`SYMBOL=`). Decision log entry 14.
 5. **D2**, bar size per contract by rule (waits on step 2).
 6. **Book features from depth** (piece D) for CL, NG, HG, ZC — streamed from
    the raw `mbp-10` files into the `.npz` layout in the cleaning standard,

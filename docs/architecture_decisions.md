@@ -470,3 +470,64 @@ contract cannot settle it statistically. The next test of the idea is D1
 "kernels off" control — predictions replaced by the combiner's intercept —
 would make this check routine in `validate_pipeline.py`. Logs:
 `data/validate_cleaned_gatewf.log`, `data/e0_CL.log`.
+
+---
+
+## 14. One feature builder per contract; kernels a contract lacks are left out (D1)
+
+*3 November 2026 · Status: in force · Code: `build_features_for_symbol` in
+`run_backtest.py`, `SYMBOL`*
+
+**Decision.** Everything from loading data to putting the slow layer on its
+daily axis is now `build_features_for_symbol(symbol)`; `main()` calls it for
+`SYMBOL` (default CL). A kernel whose data does not exist for a contract is
+left out of that contract's run, never padded:
+
+| kernel | which contracts | why |
+|---|---|---|
+| LOB | CL only for now | precomputed book features exist for CL; NG, HG, ZC have raw depth awaiting piece D |
+| VannaCharm | CL only | the Greeks file is from crude's options (LO) |
+| Sentiment | CL only | the embeddings are from crude-oil news |
+| VPIN, Kyle, Hawkes, VRP, MacroMotion, EventProximity | all eight | built from the trade tape, daily bars and generic external series |
+
+Non-CL results are tagged `_sym-<SYM>`, and their label counts the kernels
+they actually used (e.g. `1fast_2slow`).
+
+**Bar size, until D2.** CL keeps its fixed $1M so its results stay
+comparable. Every other contract's threshold is the median price × size per
+session over its first 20 sessions divided by `BARS_PER_SESSION` (default 16,
+about CL's count) — data from inside the warm-up only, which is never scored.
+D2 replaces this with a threshold that adapts session by session.
+
+**Evidence that nothing changed for CL.** Run through the refactored path,
+CL reproduces the pre-refactor runs from commit 452a01a exactly — all 41
+saved arrays identical, on seeds 0 and 1. That was D1's acceptance test.
+
+**First run of all eight** (seed 0 only, Run 25 configuration, one
+directional model per contract — not yet the cross-sectional target):
+
+| | bars | kernels with any weight | daily IC (days) | Sharpe |
+|---|---|---|---|---|
+| CL | 6,207 | none | −0.093 (168) | 0.56 |
+| NG | 7,833 | none | −0.058 (167) | 0.59 |
+| HG | 6,785 | none | +0.026 (179) | −0.57 |
+| ZC | 4,828 | none | +0.116 (121) | −2.67 |
+| ZT | 8,879 | OrderFlow 0.03, Macro 0.01 | −0.085 (186) | −3.89 |
+| BTC | 14,973 | none | −0.087 (185) | 0.18 |
+| GC | 7,890 | none | −0.043 (176) | −0.82 |
+| ES | 7,468 | none | −0.124 (174) | −0.35 |
+
+The combiner gives no kernel weight on seven of eight; averaged across the
+eight, daily IC is about −0.04 on ~1,350 contract-days (s.e. ≈ 0.027), so
+nothing separates from zero. Single-seed Sharpe swings from −3.9 to +0.6 —
+another reason not to read it. BTC's 14,973 bars (about 40 a session, not 16)
+come from its price tripling after the threshold was set: the drift D2's
+adaptive threshold exists to remove. One fix was needed: the order-flow PCA
+asked for 15 components from 11 features once LOB was absent; it now takes
+at most as many as there are (CL's 61 → 15 unchanged, re-verified identical).
+
+**Downstream impact.** XLE (the energy-sector ETF) is still MacroMotion's
+second series for every contract; for non-energy contracts a sector-matched
+series would be more meaningful, and VIX is an equity-volatility input to VRP
+everywhere. Both are modelling choices for later, recorded here so they are
+not mistaken for decisions.

@@ -44,6 +44,10 @@ _SEED_OFFSET = int(os.environ.get("SEED", "0"))
 # "_src-cleaned" in their results file name so the two never overwrite.
 DATA_SOURCE = os.environ.get("DATA_SOURCE", "legacy").lower()
 
+# Which contract (D1). CL is the default and the only one the legacy source
+# has; the others need DATA_SOURCE=cleaned. Non-CL results carry "_sym-<SYM>".
+SYMBOL = os.environ.get("SYMBOL", "CL").upper()
+
 # Contract-switch gaps (D0; docs/architecture_decisions.md entry 8). "remove"
 # divides each switch gap out of every later price change — target, daily
 # P&L, momentum, realised vol, VPIN, Kyle — keeping traded prices for bar
@@ -798,20 +802,56 @@ def _assert_on_master(arrays, names, n_master):
         )
 
 
-def main():
-    t0 = time.time()
-    print("=" * 70)
-    print("  Pristine-RKHS Walk-Forward Backtest")
-    print(f"  CL Futures | Jul 2023 - Dec 2024 | arch={os.environ.get('ARCH_VERSION', 'v1')} "
-          f"| data={DATA_SOURCE} | switch gaps={SWITCH_GAPS}")
-    print("=" * 70)
+# Bars per session for contracts other than CL until D2's adaptive rule lands
+# (decision log entry 14). CL keeps its fixed $1M so results stay comparable.
+BARS_PER_SESSION = float(os.environ.get("BARS_PER_SESSION", "16"))
+_THRESHOLD_SESSIONS = 20
 
+
+def bar_threshold_for(symbol: str, trades) -> float:
+    """Dollar-bar threshold (price × contracts) for ``symbol``.
+
+    CL: the fixed $1M every earlier run used. Others: median price × size per
+    session over the first 20 sessions, divided by BARS_PER_SESSION — only
+    data from inside the warm-up, which is never scored out of sample, so no
+    later information sets it. The "dollar" carries no contract multiplier,
+    so a fixed threshold would give NG 0.2 bars a day and ES ~7,000.
+    """
+    if symbol == "CL":
+        return 1_000_000.0
+    if "session_date" not in trades.columns:
+        raise ValueError(f"{symbol}: per-symbol bar size needs the cleaned source")
+    notional = (trades["price"].to_numpy(float) * trades["size"].to_numpy(float))
+    per = pd.Series(notional).groupby(trades["session_date"].to_numpy()).sum().sort_index()
+    thr = float(per.iloc[:_THRESHOLD_SESSIONS].median() / BARS_PER_SESSION)
+    print(f"  Bar size for {symbol}: ${thr:,.0f} (price × contracts) — "
+          f"{BARS_PER_SESSION:g} bars per session at the first "
+          f"{_THRESHOLD_SESSIONS} sessions' median")
+    return thr
+
+
+def build_features_for_symbol(symbol: str = "CL"):
+    """
+    Every feature the pipeline uses for one contract, on one time axis.
+
+    Fast kernels (LOB where book features exist, VPIN, Kyle, Hawkes, and
+    VannaCharm for CL) are resampled onto the contract's own master
+    dollar-bar schedule; slow kernels (VRP, MacroMotion, Sentiment for CL,
+    EventProximity) onto its exchange-session daily axis. A kernel whose
+    data does not exist for this contract is left out — never padded with
+    zeros or with another contract's values. FALL_2026_TASKS.md D1.
+
+    Returns a SimpleNamespace of everything main() needs from this stage.
+    """
     # ── 1. Load data ─────────────────────────────────────────────────────
     print("\n[1/7] Loading data...")
-    dl = DataLoader(os.path.join(_ROOT, "data"), "CL", source=DATA_SOURCE,
+    dl = DataLoader(os.path.join(_ROOT, "data"), symbol, source=DATA_SOURCE,
                     switch_gaps=SWITCH_GAPS)
     dates = dl.trading_dates()
-    print(f"  LOB dates: {len(dates)} ({dates[0]} — {dates[-1]})")
+    if dates:
+        print(f"  LOB dates: {len(dates)} ({dates[0]} — {dates[-1]})")
+    else:
+        print(f"  LOB: no precomputed book features for {symbol} — LOB kernel off")
 
     # Load 1-min OHLCV → daily
     ohlcv = dl.ohlcv()
@@ -851,12 +891,16 @@ def main():
         except Exception:
             continue
 
-    lob_features_all = np.concatenate(lob_feat_list, axis=0)
-    # Snapshot counts vary from 14 to a few thousand per day, so row number
-    # says nothing about when a row happened — keep the wall clock.
-    lob_ts_all = to_epoch_seconds(np.concatenate(lob_ts_list))
-    print(f"  LOB feature matrix: {lob_features_all.shape} "
-          f"({len(lob_dates_used)} days)")
+    # A symbol without book features runs without the LOB kernel; its
+    # features are never padded with zeros or borrowed from another contract.
+    lob_features_all = lob_ts_all = None
+    if lob_feat_list:
+        lob_features_all = np.concatenate(lob_feat_list, axis=0)
+        # Snapshot counts vary from 14 to a few thousand per day, so row number
+        # says nothing about when a row happened — keep the wall clock.
+        lob_ts_all = to_epoch_seconds(np.concatenate(lob_ts_list))
+        print(f"  LOB feature matrix: {lob_features_all.shape} "
+              f"({len(lob_dates_used)} days)")
 
     # ── 3. Build VPIN + Kyle + Hawkes features (fast — from trades) ─────
     print("\n[3/8] Building VPIN, Kyle's Lambda, and Hawkes features...")
@@ -867,7 +911,8 @@ def main():
     # The master dollar-bar schedule is the single definition of "bar i" for
     # the whole pipeline: every fast kernel is resampled onto it and the
     # forward-return target is computed from its closes.
-    master = build_master_bar_schedule(trades, dollar_threshold=1_000_000)
+    bar_threshold = bar_threshold_for(symbol, trades)
+    master = build_master_bar_schedule(trades, dollar_threshold=bar_threshold)
     master_ts = master["close_ts"]
     master_px = master["close_price"]
     print(f"  Master dollar-bar schedule: {len(master_ts):,} bars "
@@ -875,7 +920,7 @@ def main():
           f"{pd.to_datetime(master_ts[-1], unit='s', utc=True):%Y-%m-%d})")
 
     vpin_feats, vpin_ts = build_vpin_features(
-        trades, dollar_threshold=1_000_000, return_timestamps=True)
+        trades, dollar_threshold=bar_threshold, return_timestamps=True)
     print(f"  VPIN features: {vpin_feats.shape}")
 
     kyle_feats, kyle_ts = build_kyle_features(trades, return_timestamps=True)
@@ -888,10 +933,12 @@ def main():
     # ── 3b. VannaCharm (real Greeks) + GammaExposure ─────────────────────
     skip_kernels = set(os.environ.get("SKIP_KERNELS", "").split(","))
     greeks_bars_path = os.path.join(_ROOT, "data", "vanna_charm_bars.parquet")
-    if os.path.exists(greeks_bars_path) and "VannaCharm" not in skip_kernels:
+    # The Greeks file is from crude's options (LO); no other contract has one.
+    if (symbol == "CL" and os.path.exists(greeks_bars_path)
+            and "VannaCharm" not in skip_kernels):
         greeks_bars_df = pd.read_parquet(greeks_bars_path)
         vc_feats, vc_ts = build_vanna_charm_features_real(
-            greeks_bars_df, trades, dollar_threshold=1_000_000,
+            greeks_bars_df, trades, dollar_threshold=bar_threshold,
             return_timestamps=True
         )
         print(f"  VannaCharm features (real Greeks): {vc_feats.shape}")
@@ -913,11 +960,12 @@ def main():
     # as-of join so nothing looks forward.
     print("\n[3b2] Aligning fast kernels to the master dollar-bar schedule...")
     _named_fast = {
-        "LOB": (lob_ts_all, lob_features_all),
         "VPIN": (vpin_ts, vpin_feats),
         "Kyle": (kyle_ts, kyle_feats),
         "Hawkes": (hawkes_ts, hawkes_feats),
     }
+    if lob_features_all is not None:
+        _named_fast = {"LOB": (lob_ts_all, lob_features_all), **_named_fast}
     if vc_feats is not None:
         _named_fast["VannaCharm"] = (vc_ts, vc_feats)
 
@@ -926,7 +974,8 @@ def main():
 
     master_ts = master_ts[_start:]
     master_px = master_px[_start:]
-    lob_features_all = _aligned["LOB"][_start:]
+    if lob_features_all is not None:
+        lob_features_all = _aligned["LOB"][_start:]
     vpin_feats = _aligned["VPIN"][_start:]
     kyle_feats = _aligned["Kyle"][_start:]
     hawkes_feats = _aligned["Hawkes"][_start:]
@@ -951,12 +1000,12 @@ def main():
         print(f"\n[3c] v2 Architecture: consolidating order-flow kernels...")
 
         # Already aligned to the master schedule in 3b2 — verify, never trim
-        _assert_on_master(
-            [lob_features_all, vpin_feats, kyle_feats, hawkes_feats],
-            ["LOB", "VPIN", "Kyle", "Hawkes"], n_master,
-        )
+        _of_arrays = [vpin_feats, kyle_feats, hawkes_feats]
+        _of_names = ["VPIN", "Kyle", "Hawkes"]
+        if lob_features_all is not None:
+            _of_arrays, _of_names = [lob_features_all] + _of_arrays, ["LOB"] + _of_names
+        _assert_on_master(_of_arrays, _of_names, n_master)
         of_n = n_master
-        of_lob = lob_features_all
         of_vpin = vpin_feats
         of_kyle = kyle_feats
         of_hawkes = hawkes_feats
@@ -967,11 +1016,14 @@ def main():
         gate_kyle = of_kyle[:, 1]       # kyle_lambda_5
 
         # Concatenate all order-flow features
-        orderflow_raw = np.concatenate([of_lob, of_vpin, of_kyle, of_hawkes], axis=1)
+        orderflow_raw = np.concatenate(_of_arrays, axis=1)
         d_raw = orderflow_raw.shape[1]
-        print(f"  Raw order-flow features: {orderflow_raw.shape} "
-              f"(LOB={of_lob.shape[1]} + VPIN={of_vpin.shape[1]} + "
-              f"Kyle={of_kyle.shape[1]} + Hawkes={of_hawkes.shape[1]})")
+        # Never more components than features: without LOB there are 11.
+        # CL with LOB has 61, so its 15 components are unchanged.
+        ORDERFLOW_PCA_DIM = min(ORDERFLOW_PCA_DIM, d_raw)
+        print(f"  Raw order-flow features: {orderflow_raw.shape} ("
+              + " + ".join(f"{n}={a.shape[1]}" for n, a in zip(_of_names, _of_arrays))
+              + ")")
 
         # Expanding-window PCA to reduce to ORDERFLOW_PCA_DIM (no lookahead)
         from sklearn.decomposition import PCA
@@ -1023,7 +1075,8 @@ def main():
     # Sentiment kernel (daily embeddings from GDELT/FinBERT)
     SENT_PCA_DIM = int(os.environ.get("SENT_PCA_DIM", "10"))
     sent_path = os.path.join(_ROOT, "data", "sentiment_daily.parquet")
-    if os.path.exists(sent_path) and "Sentiment" not in skip_kernels:
+    # The sentiment embeddings are from crude-oil news; other contracts skip it.
+    if symbol == "CL" and os.path.exists(sent_path) and "Sentiment" not in skip_kernels:
         sent_df = pd.read_parquet(sent_path)
         sent_dates = pd.to_datetime(sent_df["date"])
         sent_feat_cols = [c for c in sent_df.columns if c.startswith("sent_feat_")]
@@ -1116,7 +1169,8 @@ def main():
     if _bar_keep:
         master_ts = master_ts[_bar_keep:]
         master_px = master_px[_bar_keep:]
-        lob_features_all = lob_features_all[_bar_keep:]
+        if lob_features_all is not None:
+            lob_features_all = lob_features_all[_bar_keep:]
         vpin_feats = vpin_feats[_bar_keep:]
         kyle_feats = kyle_feats[_bar_keep:]
         hawkes_feats = hawkes_feats[_bar_keep:]
@@ -1133,6 +1187,70 @@ def main():
           f"({pd.to_datetime(master_ts[0], unit='s', utc=True):%Y-%m-%d} → "
           f"{pd.to_datetime(master_ts[-1], unit='s', utc=True):%Y-%m-%d}), "
           f"dropped {_bar_keep:,} bars")
+
+
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        ARCH_VERSION=ARCH_VERSION,
+        daily=daily,
+        event_feats=event_feats,
+        gate_hawkes=gate_hawkes,
+        gate_kyle=gate_kyle,
+        gate_vpin=gate_vpin,
+        gex_feats=gex_feats,
+        hawkes_feats=hawkes_feats,
+        kyle_feats=kyle_feats,
+        lob_features_all=lob_features_all,
+        macro_feats=macro_feats,
+        master_px=master_px,
+        master_ts=master_ts,
+        n_master=n_master,
+        n_slow_axis=n_slow_axis,
+        n_trades=n_trades,
+        orderflow_feats=orderflow_feats,
+        sent_feats=sent_feats,
+        skip_kernels=skip_kernels,
+        vc_feats=vc_feats,
+        vpin_feats=vpin_feats,
+        vrp_feats=vrp_feats,
+        bar_threshold=bar_threshold,
+    )
+
+
+def main():
+    t0 = time.time()
+    print("=" * 70)
+    print("  Pristine-RKHS Walk-Forward Backtest")
+    symbol = SYMBOL
+    print(f"  {symbol} Futures | Jul 2023 - Dec 2024 | arch={os.environ.get('ARCH_VERSION', 'v1')} "
+          f"| data={DATA_SOURCE} | switch gaps={SWITCH_GAPS}")
+    print("=" * 70)
+
+    # ── 1–4b. Features for this contract (D1) ───────────────────────────
+    F = build_features_for_symbol(symbol)
+    ARCH_VERSION = F.ARCH_VERSION
+    daily = F.daily
+    event_feats = F.event_feats
+    gate_hawkes = F.gate_hawkes
+    gate_kyle = F.gate_kyle
+    gate_vpin = F.gate_vpin
+    gex_feats = F.gex_feats
+    hawkes_feats = F.hawkes_feats
+    kyle_feats = F.kyle_feats
+    lob_features_all = F.lob_features_all
+    macro_feats = F.macro_feats
+    master_px = F.master_px
+    master_ts = F.master_ts
+    n_master = F.n_master
+    n_slow_axis = F.n_slow_axis
+    n_trades = F.n_trades
+    orderflow_feats = F.orderflow_feats
+    sent_feats = F.sent_feats
+    skip_kernels = F.skip_kernels
+    vc_feats = F.vc_feats
+    vpin_feats = F.vpin_feats
+    vrp_feats = F.vrp_feats
+    bar_threshold = F.bar_threshold
 
     # ── 4c. Falsification controls (NULL_MODE) ───────────────────────────
     # A backtest you cannot break is a backtest you cannot trust. These
@@ -2621,7 +2739,8 @@ def main():
     lag_tag = "" if SLOW_FEATURE_LAG == 1 else f"_slowlag{SLOW_FEATURE_LAG}"
     gate_tag = "_gatefull" if GATE_FIT == "fullsample" else ""
     pred_tag = "" if PRED_SOURCE == "kernels" else f"_pred-{PRED_SOURCE}"
-    run_label = (f"{run_label}{src_tag}{gaps_tag}{lag_tag}{gate_tag}{pred_tag}"
+    sym_tag = "" if SYMBOL == "CL" else f"_sym-{SYMBOL}"
+    run_label = (f"{run_label}{sym_tag}{src_tag}{gaps_tag}{lag_tag}{gate_tag}{pred_tag}"
                  f"{null_tag}{seed_tag}")
     results_file = os.path.join(_ROOT, f"backtest_results_{run_label}.npz")
     np.savez(

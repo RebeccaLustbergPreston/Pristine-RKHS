@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 
@@ -67,6 +68,9 @@ def run_one(target: str, mode: str, seed: int, reuse: bool):
             print("\n".join(proc.stdout.strip().splitlines()[-15:]))
             return None
         print("ok")
+        m = re.search(r"Results saved to (\S+\.npz)", proc.stdout)
+        if m:
+            path = os.path.join(_ROOT, m.group(1))
     else:
         print(f"  [cached] {tag}")
     d = np.load(path, allow_pickle=True)
