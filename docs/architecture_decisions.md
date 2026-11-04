@@ -531,3 +531,59 @@ second series for every contract; for non-energy contracts a sector-matched
 series would be more meaningful, and VIX is an equity-volatility input to VRP
 everywhere. Both are modelling choices for later, recorded here so they are
 not mistaken for decisions.
+
+---
+
+## 15. Purge training rows whose label overlaps the test fold
+
+*4 November 2026 · Status: in force (`PURGE_LABELS=1`, the default) · Code:
+`PurgedWalkForward.split_indices(label_end=)`, stage 2 in `run_backtest.py`*
+
+**Decision.** Every bar records when its label becomes known (`label_end`:
+the bar at whose close it is realised). In both stages of the walk-forward a
+training row is used only if its label is known by the first test bar.
+
+**Evidence.** Stage 1 had a fixed 100-bar embargo; stage 2 had no gap at all
+— it trained on rows up to the test fold and tested on the next row. That is
+harmless for the next-bar target (labels one bar ahead) but not for the
+others: the next-day target looks ~16 bars ahead and the 20-day volatility
+target ~320, so the last training labels contained returns from inside the
+test fold. It showed up as a combined volatility forecast far better than any
+of its parts (ZC: +0.28 beyond trailing vol, while each kernel alone was
+−0.07 to +0.10). The shuffled-target control cannot see this kind of leak:
+shuffling destroys the overlap it relies on.
+
+**Why.** Purging by label horizon is the standard fix (López de Prado,
+*Advances in Financial Machine Learning*, 2018, ch. 7); an embargo sized for
+one horizon fails silently on a longer one.
+
+**Downstream impact.** Next-bar runs are unchanged — CL reproduces its
+reference exactly. Every earlier next-day or volatility-mode number had the
+overlap; the first pooled next-bar/next-day sweep was stopped and restarted
+for this reason. `PURGE_LABELS=0` reproduces the old behaviour (`_nopurge`).
+ElasticNetCV's own 3-fold inner CV is still unpurged; it only picks the
+penalty, but it is the same kind of leak and is noted here for later.
+
+---
+
+## 16. Score volatility forecasts against trailing volatility, per kernel
+
+*4 November 2026 · Status: in force · Code: `scoring.daily_vol_ic`,
+`vol_compare.py`; every run saves `kernel_preds_oos` and `vol_scores`*
+
+**Decision.** In volatility mode, score each kernel's own out-of-sample
+forecast (not only the combination) by rank IC against what follows each
+session's close — next-day |return| and next-5-day realised volatility — and
+by the same IC after trailing 20-day volatility is removed from forecast and
+outcome ("beyond trailing"). Compare with the shuffled-target null, pooled
+across contracts.
+
+**Why.** Volatility is persistent: trailing volatility alone forecasts the
+next five days with a rank IC around 0.5. Any forecast that tracks it scores
+well, so the plain IC cannot say whether a kernel knows anything. "Beyond
+trailing" can. Short, non-overlapping outcome windows keep the score from
+looking more certain than it is.
+
+**Context.** The project documents describe the kernels as volatility
+forecasters, but every reported run used the returns target (entry 13).
+This is the first test of the kernels on the job they were built for.

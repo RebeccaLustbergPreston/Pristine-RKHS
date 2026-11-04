@@ -75,6 +75,12 @@ GATE_FIT = os.environ.get("GATE_FIT", "walkforward").lower()
 # (TARGET_MODE=vol). Results carry "_pred-<source>".
 PRED_SOURCE = os.environ.get("PRED_SOURCE", "kernels").lower()
 
+# Purge training rows whose label is not yet known when a test fold starts
+# (decision log entry 15). Changes nothing for the next-bar target; matters
+# for the next-day target (~16 bars ahead) and the 20-day volatility target
+# (~320 bars). 0 reproduces earlier runs, tagged "_nopurge".
+PURGE_LABELS = os.environ.get("PURGE_LABELS", "1") == "1"
+
 
 def _seed(base: int) -> int:
     return base + _SEED_OFFSET
@@ -1795,6 +1801,24 @@ def main():
     print("\n  Target sanity check:")
     check_target_not_degenerate(y, label=f"{TARGET_MODE} target (full sample)")
 
+    # When each bar's label becomes known (the bar at whose close it is
+    # realised), so training rows that would see into a test fold are purged.
+    if TARGET_MODE == "vol":
+        _lab_day = np.minimum(bar_daily_idx + VOL_WINDOW, n_slow - 1)
+        label_end = np.searchsorted(bar_daily_idx, _lab_day, side="right") - 1
+    elif FORWARD_HORIZON == 1 and TARGET_CLOCK == "bar":
+        label_end = np.arange(n_fast) + 1
+    else:
+        label_end = np.searchsorted(bar_timestamps,
+                                    bar_timestamps + FORWARD_HORIZON * 86400.0,
+                                    side="left")
+    label_end = np.clip(label_end, 0, n_fast - 1)
+    _horizon = label_end - np.arange(n_fast)
+    print(f"  Label horizon: median {int(np.median(_horizon))} bars, max "
+          f"{int(_horizon.max())} (embargo 100)"
+          + ("; training rows purged when their label overlaps a test fold"
+             if PURGE_LABELS else "; NOT purged (PURGE_LABELS=0)"))
+
     engine = PurgedWalkForward(
         n_splits=8,
         embargo_bars=100,
@@ -1968,7 +1992,7 @@ def main():
         print(f"  Hyperparameter tuning: DISABLED (fixed ν=1.5, ℓ=1.0, λ=1e-3)")
 
     # Collect per-kernel OOS predictions using same fold structure
-    splits = engine.split_indices(n_fast)
+    splits = engine.split_indices(n_fast, label_end=label_end if PURGE_LABELS else None)
 
     # Every fold's test window must carry a live target. A silently
     # degenerate OOS target is what produced the original Sharpe 1.56.
@@ -2136,8 +2160,14 @@ def main():
         if s2_test_end <= s2_test_start:
             break
 
-        X_s2_train = kernel_features_oos[:s2_train_end]
-        y_s2_train = y_true_oos[:s2_train_end]
+        _s2_rows = np.arange(s2_train_end)
+        if PURGE_LABELS:
+            # Same rule as stage 1: only rows whose label is known by the
+            # first test row's bar. There was no gap here at all before.
+            _s2_rows = _s2_rows[label_end[np.asarray(oos_indices)[_s2_rows]]
+                                <= int(oos_indices[s2_test_start])]
+        X_s2_train = kernel_features_oos[_s2_rows]
+        y_s2_train = y_true_oos[_s2_rows]
         X_s2_test = kernel_features_oos[s2_test_start:s2_test_end]
 
         if COMBINER_LOSS == "huber":
@@ -2594,6 +2624,30 @@ def main():
           f"(no-skill s.e. ±{_dic['se_no_skill']:.3f}); per fold "
           f"{np.array2string(_dic['ic_folds'], precision=3)}")
 
+    # ── Volatility scores, per kernel and combined (scoring.daily_vol_ic) ──
+    # Meaningful when the kernels forecast volatility (TARGET_MODE=vol); saved
+    # either way. "partial" is the information beyond trailing volatility.
+    from scoring import daily_vol_ic as _daily_vol_ic
+    _bar_day_all = np.clip(aligner.get_daily_indices(np.arange(n_fast)), 0, n_slow - 1)
+    _vol_keys = ("ic_abs1", "ic_rv5", "partial_abs1", "partial_rv5",
+                 "baseline_ic_abs1", "baseline_ic_rv5", "n_days")
+    _vol_rows, _vol_names = [], []
+    _k_idx = np.asarray(oos_indices)
+    for _ki, _kn in enumerate(kernel_names_list):
+        _v = _daily_vol_ic(kernel_features_oos[:len(_k_idx), _ki], _k_idx,
+                           _bar_day_all, cl_daily[:n_slow])
+        _vol_rows.append([_v[k] for k in _vol_keys]); _vol_names.append(_kn)
+    _v = _daily_vol_ic(result.y_pred_oos[:len(_pred_idx)], _pred_idx,
+                       _bar_day_all, cl_daily[:n_slow])
+    _vol_rows.append([_v[k] for k in _vol_keys]); _vol_names.append("combined")
+    _vol_table = np.array(_vol_rows, dtype=float)
+    print("\n  Volatility scores (rank IC vs next-day |return| and next-5-day vol;"
+          " 'beyond' = after removing trailing 20-day vol):")
+    for _n, _r in zip(_vol_names, _vol_table):
+        print(f"    {_n:>12s}: |r| {_r[0]:+.3f}  rv5 {_r[1]:+.3f}  "
+              f"beyond |r| {_r[2]:+.3f}  beyond rv5 {_r[3]:+.3f}  ({int(_r[6])} days)")
+    print(f"    {'trailing vol':>12s}: |r| {_vol_table[0][4]:+.3f}  rv5 {_vol_table[0][5]:+.3f}")
+
     print(f"\n  Collapsing to daily resolution for evaluation...")
 
     # Map each bar to its daily index
@@ -2740,6 +2794,7 @@ def main():
     gate_tag = "_gatefull" if GATE_FIT == "fullsample" else ""
     pred_tag = "" if PRED_SOURCE == "kernels" else f"_pred-{PRED_SOURCE}"
     sym_tag = "" if SYMBOL == "CL" else f"_sym-{SYMBOL}"
+    pred_tag += "" if PURGE_LABELS else "_nopurge"
     run_label = (f"{run_label}{sym_tag}{src_tag}{gaps_tag}{lag_tag}{gate_tag}{pred_tag}"
                  f"{null_tag}{seed_tag}")
     results_file = os.path.join(_ROOT, f"backtest_results_{run_label}.npz")
@@ -2791,6 +2846,13 @@ def main():
         daily_ic=float(_dic["ic"]),
         daily_ic_folds=_dic["ic_folds"],
         daily_ic_n_days=int(_dic["n_days"]),
+        # Per-kernel stage-1 out-of-sample forecasts and their volatility
+        # scores (rows: kernels then "combined"; columns: vol_score_cols).
+        kernel_preds_oos=kernel_features_oos,
+        kernel_preds_idx=np.asarray(oos_indices),
+        vol_score_names=np.array(_vol_names),
+        vol_score_cols=np.array(_vol_keys),
+        vol_scores=_vol_table,
     )
     print(f"\n  Results saved to {os.path.basename(results_file)}")
 

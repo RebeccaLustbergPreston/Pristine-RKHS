@@ -537,9 +537,18 @@ class PurgedWalkForward:
         self.decay_half_life = decay_half_life
         self.reg_lambda = reg_lambda
 
-    def split_indices(self, n_total: int) -> List[Tuple[np.ndarray, np.ndarray]]:
+    def split_indices(self, n_total: int,
+                      label_end: Optional[np.ndarray] = None
+                      ) -> List[Tuple[np.ndarray, np.ndarray]]:
         """
         Generate purged expanding-window train/test index pairs.
+
+        label_end : (n_total,) optional — for each bar, the bar at whose close
+            its label is fully known. Training bars whose label is not known
+            by the first test bar's close are purged (López de Prado 2018,
+            ch. 7). The fixed embargo alone is not enough once a label looks
+            further ahead than the embargo (a 20-day volatility target is
+            ~320 bars; the embargo is 100).
 
         Returns
         -------
@@ -570,6 +579,8 @@ class PurgedWalkForward:
                 train_end = self.min_train_bars
 
             train_idx = np.arange(0, train_end)
+            if label_end is not None:
+                train_idx = train_idx[np.asarray(label_end)[train_idx] <= test_start]
             test_idx = np.arange(test_start, test_end)
             splits.append((train_idx, test_idx))
 
