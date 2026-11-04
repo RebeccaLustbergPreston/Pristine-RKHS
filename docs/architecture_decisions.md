@@ -682,3 +682,42 @@ cross-sectional target across the eight contracts on established premia
 trailing-volatility sizing. Log: `data/relvol_compare_pooled.log`; runs in
 `data/vol_compare_runs.jsonl` (`"target": "relvol"`).
 
+---
+
+## 18. Ridge on the same features: the features, not the model
+
+*4 November 2026 · Status: tested — no skill · Code: `ridge_check.py`,
+`test_ridge_check.py`*
+
+**Question.** The kernel stack fits a flexible model on ~300 training
+sessions and finds nothing (entries 11, 16, 17). Is it overfitting, or is
+there nothing to find? Ask the same questions with the least flexible model.
+
+**Method.** One row per session: OrderFlow at the session's last bar, VRP
+and Macro from the last completed day (the features all eight contracts
+share, at the pipeline's lag). RidgeCV, expanding window from 40% of the
+sample, refit every 20 sessions, label-overlap purge, features standardised
+on training rows only. Same scores as before: daily rank IC for the
+next-day return; "beyond trailing" next-5-day vol for the relative-vol
+target. Null: 50 retrains on the target shuffled across sessions per
+contract, scored against the real outcomes. (RidgeCV's own leave-one-out
+choice of penalty is not purged; with 1-day labels that is immaterial, with
+20-day labels it can only flatter the real model.)
+
+**Result** (all eight contracts, cleaned data):
+
+| target | ridge, pooled | shuffled null, pooled | z | contracts above null's 95th pct |
+|---|---|---|---|---|
+| next-day return | −0.032 | −0.000 ± 0.025 | −1.24 | 0 of 8 |
+| relative vol, beyond trailing | −0.082 | +0.004 ± 0.060 | −1.42 | 0 of 8 |
+
+Ridge does no better than the kernels. The strongest single contract (CL
+relative vol, +0.20) beats 88% of its nulls — about what one contract in
+eight does by chance. Log: `data/ridge_check.log`.
+
+**Conclusion.** The model is not the problem: the shared features carry no
+detectable information about next-day direction or relative volatility on
+this data. Tuning model capacity cannot fix that. F1 (section F of
+`FALL_2026_TASKS.md`) starts from known premia for this reason; the features
+are tested there only as an overlay.
+
