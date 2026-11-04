@@ -90,12 +90,21 @@ class DataLoader:
         Contract root (default: "CL").
     source : str
         "legacy" (default) or "cleaned" — see the module docstring.
+    switch_gaps : str
+        "keep" (default) leaves the vendor's unadjusted contract switches in
+        the prices. "remove" divides each switch gap out of every later
+        price change (roll_gaps.py; docs/architecture_decisions.md entry 8):
+        trades gain ``price_adj`` beside the traded ``price``, and the 1-min
+        bars' open/high/low/close become adjusted, raw kept as ``<col>_raw``.
     """
 
     def __init__(self, data_dir: str = "data/", symbol: str = "CL",
-                 source: str = "legacy"):
+                 source: str = "legacy", switch_gaps: str = "keep"):
         if source not in SOURCES:
             raise ValueError(f"source={source!r}; expected one of {SOURCES}")
+        if switch_gaps not in ("keep", "remove"):
+            raise ValueError(f"switch_gaps={switch_gaps!r}; expected keep or remove")
+        self.switch_gaps = switch_gaps
         if source == "legacy" and symbol != "CL":
             raise ValueError("legacy data exists for CL only; use source='cleaned'")
         self.data_dir = os.path.abspath(data_dir)
@@ -170,6 +179,9 @@ class DataLoader:
                 self._trades["ts_event"] = pd.to_datetime(
                     self._trades["ts_event"], utc=True
                 )
+            if self.switch_gaps == "remove":
+                from roll_gaps import adjust_trades
+                adjust_trades(self._trades)
         df = self._trades
         if date_range:
             start, end = pd.Timestamp(date_range[0], tz="UTC"), pd.Timestamp(date_range[1], tz="UTC")
@@ -189,6 +201,20 @@ class DataLoader:
             if self.source == "cleaned":
                 # Same shape as the legacy file: ts_event is the index.
                 self._ohlcv = self._ohlcv.set_index("ts_event")
+            self._ohlcv = self._ohlcv.sort_index(kind="stable")
+            if self.switch_gaps == "remove":
+                from roll_gaps import adjust_ohlcv, switch_rows
+                self._ohlcv = adjust_ohlcv(self._ohlcv)
+                if self.source == "cleaned":
+                    # The bars must switch contract exactly where the tape does.
+                    ids = self._ohlcv["instrument_id"].to_numpy()
+                    k = switch_rows(ids)
+                    bars = list(zip(ids[k - 1].tolist(), ids[k].tolist()))
+                    tape = [(s["from"], s["to"]) for s in
+                            self.cleaning_report()["contract_switches"]]
+                    if bars != tape:
+                        raise ValueError(f"{self.symbol}: 1-min bars switch contract "
+                                         f"{bars} but the trade tape switches {tape}")
         df = self._ohlcv
         if date_range:
             start, end = pd.Timestamp(date_range[0], tz="UTC"), pd.Timestamp(date_range[1], tz="UTC")

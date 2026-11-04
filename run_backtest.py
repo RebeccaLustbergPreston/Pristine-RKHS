@@ -44,6 +44,13 @@ _SEED_OFFSET = int(os.environ.get("SEED", "0"))
 # "_src-cleaned" in their results file name so the two never overwrite.
 DATA_SOURCE = os.environ.get("DATA_SOURCE", "legacy").lower()
 
+# Contract-switch gaps (D0; docs/architecture_decisions.md entry 8). "remove"
+# divides each switch gap out of every later price change — target, daily
+# P&L, momentum, realised vol, VPIN, Kyle — keeping traded prices for bar
+# sizes. "keep" reproduces runs before the fix; those results carry
+# "_gaps-kept" in their file name.
+SWITCH_GAPS = os.environ.get("SWITCH_GAPS", "remove").lower()
+
 
 def _seed(base: int) -> int:
     return base + _SEED_OFFSET
@@ -193,6 +200,10 @@ def build_vpin_features(trades_df, dollar_threshold=1_000_000, vpin_window=50,
     each bar, so features can be aligned by wall clock instead of row number.
     """
     prices = trades_df["price"].values
+    # Bar size is notional (traded price × size); every price *change* inside
+    # a bar — close, volatility, tick rule — uses the switch-adjusted price
+    # when the tape has one, so a contract switch is not read as a move.
+    moves = trades_df["price_adj"].values if "price_adj" in trades_df.columns else prices
     sizes = trades_df["size"].values.astype(float)
     trade_ts = to_epoch_seconds(trades_df["ts_event"])
 
@@ -204,7 +215,7 @@ def build_vpin_features(trades_df, dollar_threshold=1_000_000, vpin_window=50,
     for i in range(len(prices)):
         p, s = prices[i], sizes[i]
         cum_dol += p * s
-        bar_prices.append(p)
+        bar_prices.append(moves[i])
         bar_sizes.append(s)
         if cum_dol >= dollar_threshold:
             bp = np.array(bar_prices)
@@ -262,7 +273,9 @@ def build_kyle_features(trades_df, windows=(1, 5, 20), return_timestamps=False):
     Bins are fixed trade counts, so ~5,000 rows span the entire tape. Without
     the returned timestamps these rows cannot be matched to any other kernel.
     """
-    prices = trades_df["price"].values.astype(float)
+    # Price changes only, so the switch-adjusted price when there is one.
+    prices = trades_df["price_adj" if "price_adj" in trades_df.columns
+                       else "price"].values.astype(float)
     sizes = trades_df["size"].values.astype(float)
     trade_ts = to_epoch_seconds(trades_df["ts_event"])
     sides = trades_df["side"].values if "side" in trades_df.columns else None
@@ -770,12 +783,13 @@ def main():
     print("=" * 70)
     print("  Pristine-RKHS Walk-Forward Backtest")
     print(f"  CL Futures | Jul 2023 - Dec 2024 | arch={os.environ.get('ARCH_VERSION', 'v1')} "
-          f"| data={DATA_SOURCE}")
+          f"| data={DATA_SOURCE} | switch gaps={SWITCH_GAPS}")
     print("=" * 70)
 
     # ── 1. Load data ─────────────────────────────────────────────────────
     print("\n[1/7] Loading data...")
-    dl = DataLoader(os.path.join(_ROOT, "data"), "CL", source=DATA_SOURCE)
+    dl = DataLoader(os.path.join(_ROOT, "data"), "CL", source=DATA_SOURCE,
+                    switch_gaps=SWITCH_GAPS)
     dates = dl.trading_dates()
     print(f"  LOB dates: {len(dates)} ({dates[0]} — {dates[-1]})")
 
@@ -2509,7 +2523,8 @@ def main():
     null_tag = "" if NULL_MODE == "none" else f"_null-{NULL_MODE}"
     seed_tag = "" if _SEED_OFFSET == 0 else f"_seed{_SEED_OFFSET}"
     src_tag = "" if DATA_SOURCE == "legacy" else f"_src-{DATA_SOURCE}"
-    run_label = f"{run_label}{src_tag}{null_tag}{seed_tag}"
+    gaps_tag = "_gaps-kept" if SWITCH_GAPS == "keep" else ""
+    run_label = f"{run_label}{src_tag}{gaps_tag}{null_tag}{seed_tag}"
     results_file = os.path.join(_ROOT, f"backtest_results_{run_label}.npz")
     np.savez(
         results_file,

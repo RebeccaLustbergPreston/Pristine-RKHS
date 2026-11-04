@@ -70,6 +70,8 @@ def results_path(mode: str, seed: int) -> str:
     source = os.environ.get("DATA_SOURCE", "legacy").lower()
     if source != "legacy":
         label += f"_src-{source}"
+    if os.environ.get("SWITCH_GAPS", "remove").lower() == "keep":
+        label += "_gaps-kept"
     if mode != "none":
         label += f"_null-{mode}"
     if seed != 0:

@@ -79,14 +79,23 @@ def build_master_bar_schedule(trades_df, dollar_threshold: float = 1_000_000):
     target is computed from its close prices, so it is the single
     definition of "bar i" for the whole pipeline.
 
+    Bar size is measured on the traded ``price`` (a level: price × size).
+    If the tape carries ``price_adj`` — contract-switch gaps removed, see
+    roll_gaps.py — the close price, and so every return computed from it,
+    comes from that instead.
+
     Returns a dict with:
-        close_ts    : (n_bars,) float64 — epoch seconds at each bar close
-        close_price : (n_bars,) float64 — trade price at each bar close
-        boundary    : (n_bars,) int64   — row in trades_df closing the bar
+        close_ts        : (n_bars,) float64 — epoch seconds at each bar close
+        close_price     : (n_bars,) float64 — price at each bar close (adjusted
+                          if the tape has price_adj)
+        close_price_raw : (n_bars,) float64 — traded price at each bar close
+        boundary        : (n_bars,) int64   — row in trades_df closing the bar
     """
     ts_s = to_epoch_seconds(trades_df["ts_event"])
     prices = trades_df["price"].values.astype(float)
     sizes = trades_df["size"].values.astype(float)
+    close_src = (trades_df["price_adj"].values.astype(float)
+                 if "price_adj" in trades_df.columns else prices)
 
     cum_notional = np.cumsum(prices * sizes)
     if cum_notional[-1] < dollar_threshold:
@@ -105,7 +114,8 @@ def build_master_bar_schedule(trades_df, dollar_threshold: float = 1_000_000):
 
     return {
         "close_ts": close_ts,
-        "close_price": prices[boundaries],
+        "close_price": close_src[boundaries],
+        "close_price_raw": prices[boundaries],
         "boundary": boundaries.astype(np.int64),
     }
 
