@@ -13,7 +13,8 @@ done), and CL is now the cleaned `CL.v.0` tape rather than `CL.c.0`. See
 
 **4 November 2026:** pooled over all eight contracts, neither the next-bar nor
 the next-day target beats a shuffled target, and no kernel forecasts
-volatility beyond trailing volatility (decision log entries 11 and 16).
+volatility beyond trailing volatility, absolute or relative (decision log
+entries 11, 16 and 17).
 
 ---
 

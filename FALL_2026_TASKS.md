@@ -69,7 +69,8 @@ step 7 has a score that tells real results from shuffled ones.
    target, with bars used only to build the fast features — the position is
    held overnight, and F1 and G both work on the daily calendar.
    **Volatility mode checked too (entry 16):** no kernel forecasts volatility
-   beyond trailing 20-day volatility on any of the eight contracts.
+   beyond trailing 20-day volatility on any of the eight contracts, and a
+   relative-volatility target (entry 17) shows nothing either.
 3. **D0 on the new CL — done 3 November.** Switch gaps removed from every
    price change, forward only (`roll_gaps.py`; decision log entry 8).
    Baseline and post-fix falsification runs are in the decision log: the

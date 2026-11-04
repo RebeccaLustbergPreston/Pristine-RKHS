@@ -638,3 +638,47 @@ and should forecast relative to it (for example, the log of future
 volatility over trailing volatility), so a stale intercept cannot score.
 Log: `data/vol_compare_pooled.log`; runs in `data/vol_compare_runs.jsonl`.
 
+---
+
+## 17. Forecast volatility relative to trailing volatility (relvol)
+
+*4 November 2026 · Status: tested — no kernel separates · Code:
+`TARGET_MODE=relvol`, `vol_compare.py --target relvol`*
+
+**Decision.** Add a volatility target that trains on log(forward 20-day
+volatility ÷ trailing 20-day volatility), the trailing window being the 20
+daily returns up to the session's close (the baseline `daily_vol_ic`
+removes). Score it exactly as entry 16.
+
+**Why.** In entry 16 the combined forecast scored −4.35 s.e. below its null
+because it was mostly a stale intercept: the training window's mean
+volatility level. A relative target has no level to go stale, so a forecast
+can score only by what trailing volatility misses. It is the fair version of
+the question the kernels were described as answering.
+
+**Result** (commit `9322a19`, all eight contracts, three seeds, 48 runs, no
+failures; Sentiment and VannaCharm on CL only):
+
+| forecast | IC, next-5-day vol | beyond trailing | shuffled-null beyond | gap ÷ s.e. |
+|---|---|---|---|---|
+| Macro | +0.006 | +0.004 | −0.016 | 0.49 |
+| OrderFlow | −0.020 | −0.018 | −0.003 | −0.39 |
+| VRP | +0.030 | +0.029 | +0.005 | 0.60 |
+| Sentiment (CL) | −0.055 | −0.052 | +0.005 | −0.51 |
+| VannaCharm (CL) | +0.152 | −0.034 | −0.030 | −0.03 |
+| combined | +0.036 | +0.007 | −0.007 | 0.24 |
+| trailing 20-day vol | +0.188 | — | — | — |
+
+The stale-intercept artifact is gone (combined −0.130 → +0.007), and with it
+any sign of skill: every kernel is within 0.6 s.e. of its null, on
+next-5-day volatility and on next-day |return| alike. VannaCharm's plain IC
+of +0.15 is all trailing volatility; beyond it, nothing.
+
+**Downstream.** On this data the kernels forecast neither direction (entry
+11) nor volatility, absolute or relative. Further tuning of the kernel stack
+against these targets is not justified. The next step is F1 — a
+cross-sectional target across the eight contracts on established premia
+(momentum, carry), with the kernels tested only as an overlay against plain
+trailing-volatility sizing. Log: `data/relvol_compare_pooled.log`; runs in
+`data/vol_compare_runs.jsonl` (`"target": "relvol"`).
+
