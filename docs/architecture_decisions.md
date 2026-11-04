@@ -246,3 +246,125 @@ correlation is about zero in every mode either way. This is what step 7
 (a score that separates real from shuffled) is for; nothing should be tuned
 before it. Logs: `data/validate_cleaned_pre_D0.log`,
 `data/validate_cleaned_post_D0.log`.
+
+---
+
+## 9. Bars belong to the session they trade in, by session start time
+
+*3 November 2026 · Status: in force for `DATA_SOURCE=cleaned` · Code:
+`run_backtest.py` (daily timestamps passed to `MultiResolutionAligner`)*
+
+**Decision.** A bar belongs to the last session that *started* at or before
+it, with each session starting at 17:00 Chicago time on the previous
+session's date — not to the last *midnight UTC*.
+
+**Context.** `MultiResolutionAligner` assigns each bar to the last daily
+timestamp at or before it. With the legacy data a "day" was a UTC calendar
+date, so midnight was the right boundary. With exchange sessions (entry 4) a
+session closes at about 21:00–22:00 UTC and the next opens an hour later, so
+midnight-UTC timestamps put the first two hours of session d+1 into day d.
+
+**Why.** The end-of-day position is the position at a day's last bar, and it
+earns the close-to-close return from d to d+1. Under the midnight mapping
+that "last bar" was two hours into session d+1 — after part of the return it
+is credited with had already happened. A lookahead in the P&L, created by
+moving to session days and caught before any result was quoted on it.
+
+**Downstream impact.** End-of-day decisions are made at the session's own
+last bar. The test `test_evening_bar_belongs_to_the_next_session` pins it.
+
+---
+
+## 10. Daily features reach a bar from the last completed day
+
+*3 November 2026 · Status: in force (`SLOW_FEATURE_LAG=1`, the default) ·
+Code: `MultiResolutionAligner(feature_lag=)`, `get_feature_day_indices`*
+
+**Decision.** A bar during day d sees daily features from day d−1, never
+from d. Applies to the slow kernels (VRP, MacroMotion, Sentiment) in both
+the combiner and the stage-1 loop, the momentum regime gate, and the
+momentum direction signal. Which day a bar *belongs to* (for P&L and
+scoring) is unchanged.
+
+**Evidence.** Several daily features are computed from the day's own close:
+VRP's `mom_5` and `mom_21` (`close[i] / close[i-5]`), VRP's `log_vix` (that
+day's VIX close), the 20-day momentum and the momentum gate. Mapped to the
+bars of the same day, a bar at 10:00 knew where crude and VIX would close at
+16:00. MacroMotion was already safe (it uses returns up to d−1); the event
+gate is safe (scheduled events are known in advance) and is left unlagged.
+This was in the legacy pipeline too, and nothing in the falsification suite
+catches it — the shuffled-target control tests for leaks into the target,
+not for features that see the future of their own day.
+
+**Alternatives.** Rewrite each daily feature to stop at d−1. More places to
+get wrong, and every future daily feature would need the same care; one lag
+at the point where daily meets intraday covers all of them.
+
+**Downstream impact.** Every result before this entry used same-day daily
+features. `SLOW_FEATURE_LAG=0` reproduces them (results tagged `_slowlag0`).
+Falsification suite re-run on the new default.
+
+**Measured** (cleaned CL, gaps removed, Run 25 configuration, three seeds;
+Sharpe mean ± sd):
+
+| mode | same-day features (lag 0) | last completed day (lag 1) |
+|---|---|---|
+| real features | 0.36 ± 1.10 | 0.76 ± 0.16 |
+| pure noise | −0.31 ± 0.62 | −0.88 ± 0.96 |
+| shuffled in time | −0.71 ± 1.82 | −1.01 ± 0.58 |
+| shuffled target | −0.10 ± 1.95 | −0.75 ± 1.18 |
+| leakage check (< 0.05) | 0.0132 | 0.0179 |
+
+With the lag, Sharpe separates real from shuffled and from noise for the
+first time on cleaned data — by the suite's own rule, on three seeds. Read it
+with entry 11: the predictions themselves have no daily skill (IC about zero
+or negative), so the separation is coming from something other than the
+kernels forecasting next-day returns — most plausibly the momentum direction
+and the volatility filter. That is the question E0 asks, and three seeds is
+too few to lean on; `TODO.md` item 7 asks for ten. Logs:
+`data/validate_cleaned_lag1.log`.
+
+---
+
+## 11. Choosing between next-bar and next-day targets by test, not by Sharpe
+
+*3 November 2026 · Status: test built; decision pending pooled data · Code:
+`TARGET_CLOCK`, `scoring.py`, `compare_targets.py`*
+
+**Decision.** Add a true next-day target (`TARGET_CLOCK=day`: the return 24
+hours ahead on the bar clock — for a session's last bar, close to next
+close) beside the existing next-bar one, and choose between them with
+`compare_targets.py`: train on each, score both by the daily IC of the
+end-of-session prediction against the next session's return, and compare
+each with its own shuffled-target null across seeds.
+
+**Context.** `FORWARD_HORIZON=1` was printed as "1-day forward returns" but
+computed the next *bar's* return (~1.5 hours at 16 bars a session). Every
+run so far, Run 25 included, predicted the next bar while being graded on
+overnight positions (`TODO.md` item 3). The label is fixed; the default is
+unchanged so earlier runs reproduce.
+
+**Why this test.** Sharpe cannot separate real from shuffled here (entry 8),
+so it cannot choose either. Scoring both targets on the same outcome — the
+return the end-of-day position earns — makes them comparable; a rank
+correlation keeps a few large days from carrying it; the shuffled null per
+target says whether either has any skill at all.
+
+**Power.** The no-skill standard error of a daily IC is about 1/sqrt(n). On
+cleaned CL the out-of-sample window scores 168 days (±0.077), so only an IC
+above ~0.15 would separate from noise — far above typical daily-return ICs.
+Pooled across eight contracts (D1) it falls to roughly ±0.03. CL alone is a
+dry run of the method; the binding decision waits for the pooled run.
+
+**Dry run on cleaned CL** (gaps removed, lag 1, three seeds, 168 scored
+days, no-skill s.e. ±0.077):
+
+| training target | daily IC, real | daily IC, shuffled target | gap ÷ s.e. |
+|---|---|---|---|
+| next bar | −0.040 ± 0.063 | +0.022 ± 0.042 | −0.52 |
+| next day | −0.018 ± 0.045 | −0.031 ± 0.045 | +0.12 |
+
+Neither separates from its null — as the power calculation predicted. On CL
+alone the choice cannot be made from results. In several folds the combiner
+gives every kernel zero weight, so the prediction is constant there and the
+fold has no IC. Log: `data/compare_targets_CL.log`.

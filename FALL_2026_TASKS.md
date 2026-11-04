@@ -62,7 +62,9 @@ step 7 has a score that tells real results from shuffled ones.
    into P&L: `DataLoader(data_dir, symbol, source="cleaned")` reads
    `data/cleaned-master/<SYM>/`, exposes contract switches, tick value and
    `cost_per_trade()`. The pipeline still uses the flat `COST_PER_TRADE`.
-2. **Decide: predict hours or days** (`TODO.md` item 3). This sets what the
+2. **Decide: predict hours or days** (`TODO.md` item 3). *Test built
+   (`compare_targets.py`, decision log entry 11); on CL alone neither target
+   separates from noise, so the binding run waits for D1.* This sets what the
    bar size in step 5 has to achieve. Recommendation: a daily target, with
    bars used only to build the fast features — F1 and G both work on the
    daily calendar.

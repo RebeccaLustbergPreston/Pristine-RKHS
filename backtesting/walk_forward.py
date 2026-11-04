@@ -129,9 +129,21 @@ class MultiResolutionAligner:
         self,
         bar_timestamps: np.ndarray,
         daily_timestamps: np.ndarray,
+        feature_lag: int = 0,
     ):
+        """
+        daily_timestamps : when each day *starts* — a bar belongs to the last
+            day starting at or before it. For exchange sessions, pass session
+            start times, not midnight, or the evening that opens session d+1
+            is counted as day d.
+        feature_lag : how many days back a bar's *features* come from. A
+            daily feature for day d may use d's close, which a bar during d
+            cannot know yet; lag 1 gives every bar the last completed day.
+            get_daily_indices (which day a bar is in) is never lagged.
+        """
         self.bar_ts = np.asarray(bar_timestamps, dtype=np.float64)
         self.daily_ts = np.asarray(daily_timestamps, dtype=np.float64)
+        self.feature_lag = int(feature_lag)
         # Pre-compute mapping: bar_i → daily_j where daily_j is the most
         # recent daily observation at or before bar_i's timestamp.
         self._bar_to_daily = self._build_mapping()
@@ -147,6 +159,11 @@ class MultiResolutionAligner:
     def get_daily_indices(self, bar_indices: np.ndarray) -> np.ndarray:
         """Return the daily indices corresponding to the given bar indices."""
         return self._bar_to_daily[bar_indices]
+
+    def get_feature_day_indices(self, bar_indices: np.ndarray) -> np.ndarray:
+        """The day whose daily features a bar may use: its own day minus
+        feature_lag (never before day 0)."""
+        return np.maximum(self._bar_to_daily[bar_indices] - self.feature_lag, 0)
 
     def align_features(
         self,
@@ -168,7 +185,7 @@ class MultiResolutionAligner:
         -------
         slow_aligned : array, shape (n_bars_subset, D_slow)
         """
-        daily_idx = self.get_daily_indices(bar_indices)
+        daily_idx = self.get_feature_day_indices(bar_indices)
         return slow_features[daily_idx]
 
 
@@ -338,7 +355,7 @@ class TwoLevelKernelCombiner:
         if (self.momentum_gate is not None
                 and self.daily_prices is not None
                 and getattr(self.momentum_gate, '_fitted', False)):
-            daily_idx = self.aligner.get_daily_indices(bar_indices)
+            daily_idx = self.aligner.get_feature_day_indices(bar_indices)
             gate_daily = self.momentum_gate.gate_values(self.daily_prices)
             # Map daily gate values to bar resolution
             lookback = max(self.momentum_gate.long_window,

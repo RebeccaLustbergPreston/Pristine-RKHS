@@ -51,6 +51,12 @@ DATA_SOURCE = os.environ.get("DATA_SOURCE", "legacy").lower()
 # "_gaps-kept" in their file name.
 SWITCH_GAPS = os.environ.get("SWITCH_GAPS", "remove").lower()
 
+# Daily features reach a bar from the last *completed* day (lag 1). Several
+# use the day's own close (VRP's mom_5/mom_21, VIX close, the momentum gate),
+# which a bar during that day cannot know. 0 reproduces runs before November
+# 2026, tagged "_slowlag0". docs/architecture_decisions.md entry 10.
+SLOW_FEATURE_LAG = int(os.environ.get("SLOW_FEATURE_LAG", "1"))
+
 
 def _seed(base: int) -> int:
     return base + _SEED_OFFSET
@@ -1478,6 +1484,15 @@ def main():
     # assert the daily grid really covers the bars.
     bar_timestamps = master_ts
     daily_timestamps = to_epoch_seconds(daily.index[:n_slow])
+    if DATA_SOURCE == "cleaned":
+        # Cleaned days are exchange sessions, which start at 17:00 Chicago
+        # time on the previous session's date (decision log entry 9). Mapping
+        # bars by midnight UTC would count the first hours of session d+1 as
+        # day d, so the end-of-day position would see the next session.
+        _sess = pd.DatetimeIndex(daily.index[:n_slow])
+        _prev = _sess.shift(-1, freq="D")[:1].append(_sess[:-1])
+        daily_timestamps = to_epoch_seconds(
+            (_prev + pd.Timedelta(hours=17)).tz_localize("America/Chicago"))
 
     if daily_timestamps[-1] < bar_timestamps[-1] - 5 * 86400.0:
         raise ValueError(
@@ -1488,7 +1503,8 @@ def main():
             f"trailing bars would clip to the last day."
         )
 
-    aligner = MultiResolutionAligner(bar_timestamps, daily_timestamps)
+    aligner = MultiResolutionAligner(bar_timestamps, daily_timestamps,
+                                     feature_lag=SLOW_FEATURE_LAG)
     _bar_day = aligner.get_daily_indices(np.arange(n_fast))
     print(f"  Bar→day mapping: {_bar_day.min()}..{_bar_day.max()} over "
           f"{n_slow} days, {len(np.unique(_bar_day))} distinct days covered")
@@ -1552,10 +1568,20 @@ def main():
 
     # Forward targets
     FORWARD_HORIZON = int(os.environ.get("FORWARD_HORIZON", "1"))
+    # What a horizon of 1 means. "bar" (default, every run before November
+    # 2026): the next master bar's return, ~1.5 hours ahead at 16 bars a
+    # session. "day": the return 24 hours ahead on the bar clock — for the
+    # session's last bar, close to next close, which is what the end-of-day
+    # position earns. Horizons above 1 are always days. See compare_targets.py.
+    TARGET_CLOCK = os.environ.get("TARGET_CLOCK", "bar").lower()
+    if TARGET_CLOCK not in ("bar", "day"):
+        raise ValueError(f"TARGET_CLOCK={TARGET_CLOCK!r}; expected bar or day")
     TARGET_MODE = os.environ.get("TARGET_MODE", "returns").lower()
     VOL_WINDOW = int(os.environ.get("VOL_WINDOW", "20"))
 
     bar_daily_idx = aligner.get_daily_indices(np.arange(n_fast))
+    # Which day's daily *features* each bar may see (last completed day).
+    bar_feature_day_idx = aligner.get_feature_day_indices(np.arange(n_fast))
     # Forward returns come from the master dollar-bar closes. Mapping daily
     # closes down onto bars made the target ~95% zeros even once the mapping
     # was correct, because many bars share a single day.
@@ -1590,7 +1616,7 @@ def main():
         mom_20 = np.zeros(len(cl_daily))
         for i in range(20, len(cl_daily)):
             mom_20[i] = cl_daily[i] / cl_daily[i - 20] - 1
-        bar_momentum = mom_20[np.clip(bar_daily_idx, 0, len(mom_20) - 1)]
+        bar_momentum = mom_20[np.clip(bar_feature_day_idx, 0, len(mom_20) - 1)]
 
         print(f"  Vol target range: [{np.nanmin(y):.3f}, {np.nanmax(y):.3f}] (log annualized)")
         print(f"  Vol target NaN%:  {np.isnan(y).mean():.1%}")
@@ -1602,17 +1628,20 @@ def main():
 
     else:
         # ── Predict forward returns (original mode) ──
-        print(f"\n  Target: {FORWARD_HORIZON}-day forward returns")
         y_returns_bar = None
         bar_momentum = None
 
-        if FORWARD_HORIZON == 1:
+        if FORWARD_HORIZON == 1 and TARGET_CLOCK == "bar":
+            # This is the next *bar*, not the next day — it was printed as
+            # "1-day forward returns" until November 2026.
+            print("\n  Target: next-bar returns (FORWARD_HORIZON=1, TARGET_CLOCK=bar)")
             y = np.diff(np.log(bar_prices + 1e-8), prepend=np.log(bar_prices[0]))
             y = y[1:]  # shift for forward return
             y = np.append(y, 0)  # pad last
         else:
             # Horizon stays in days, but is measured on the bar clock so the
             # target varies bar to bar instead of being a daily step function.
+            print(f"\n  Target: {FORWARD_HORIZON}-day forward returns (bar clock)")
             log_p = np.log(bar_prices + 1e-8)
             j = np.searchsorted(bar_timestamps,
                                 bar_timestamps + FORWARD_HORIZON * 86400.0,
@@ -1692,7 +1721,7 @@ def main():
 
     # Align slow to fast resolution by wall clock, not by stretching the
     # daily axis evenly across the bar axis (bars are not uniform in time)
-    slow_to_fast_idx = np.clip(bar_daily_idx, 0, n_slow - 1)
+    slow_to_fast_idx = np.clip(bar_feature_day_idx, 0, n_slow - 1)
     slow_fmaps_aligned = []
     for phi_s in slow_fmaps:
         slow_fmaps_aligned.append(phi_s[slow_to_fast_idx])
@@ -1823,7 +1852,7 @@ def main():
                 d_train = data[train_idx]
                 d_test = data[test_idx]
             else:
-                slow_to_fast = np.clip(bar_daily_idx, 0, data.shape[0] - 1)
+                slow_to_fast = np.clip(bar_feature_day_idx, 0, data.shape[0] - 1)
                 d_train = data[slow_to_fast[train_idx]]
                 d_test = data[slow_to_fast[test_idx]]
 
@@ -2383,6 +2412,17 @@ def main():
     # ── Collapse to daily resolution for honest evaluation ──────────────
     # Bar-level positions use repeated daily closes → most bars show zero
     # return. Aggregate to daily: take end-of-day position and daily return.
+    # ── Daily IC: the prediction itself, scored on the traded outcome ──
+    from scoring import daily_ic as _daily_ic, fold_of as _fold_of
+    _pred_idx = np.asarray(result.oos_indices)[:len(result.y_pred_oos)]
+    _dic = _daily_ic(result.y_pred_oos[:len(_pred_idx)], _pred_idx,
+                     np.clip(aligner.get_daily_indices(np.arange(n_fast)), 0, n_slow - 1),
+                     cl_daily[:n_slow], _fold_of(_pred_idx, two_stage_oos_idx))
+    print(f"\n  Daily IC (end-of-session prediction vs next session's return): "
+          f"{_dic['ic']:+.4f} over {_dic['n_days']} days "
+          f"(no-skill s.e. ±{_dic['se_no_skill']:.3f}); per fold "
+          f"{np.array2string(_dic['ic_folds'], precision=3)}")
+
     print(f"\n  Collapsing to daily resolution for evaluation...")
 
     # Map each bar to its daily index
@@ -2511,7 +2551,8 @@ def main():
     print(f"{'=' * 70}")
 
     # Save results for charting
-    horizon_tag = f"_h{FORWARD_HORIZON}d" if FORWARD_HORIZON > 1 else ""
+    horizon_tag = (f"_h{FORWARD_HORIZON}d" if FORWARD_HORIZON > 1
+                   else "_tday" if TARGET_CLOCK == "day" else "")
     signal_tag = f"_{SIGNAL_MODE}" if SIGNAL_MODE != "ou" else ""
     warmup_tag = f"_wu{WARMUP_DAYS}" if WARMUP_DAYS > 0 else ""
     loss_tag = f"_{COMBINER_LOSS}" if COMBINER_LOSS != "mse" else ""
@@ -2524,7 +2565,8 @@ def main():
     seed_tag = "" if _SEED_OFFSET == 0 else f"_seed{_SEED_OFFSET}"
     src_tag = "" if DATA_SOURCE == "legacy" else f"_src-{DATA_SOURCE}"
     gaps_tag = "_gaps-kept" if SWITCH_GAPS == "keep" else ""
-    run_label = f"{run_label}{src_tag}{gaps_tag}{null_tag}{seed_tag}"
+    lag_tag = "" if SLOW_FEATURE_LAG == 1 else f"_slowlag{SLOW_FEATURE_LAG}"
+    run_label = f"{run_label}{src_tag}{gaps_tag}{lag_tag}{null_tag}{seed_tag}"
     results_file = os.path.join(_ROOT, f"backtest_results_{run_label}.npz")
     np.savez(
         results_file,
@@ -2567,6 +2609,13 @@ def main():
         seed_offset=_SEED_OFFSET,
         n_fast_bars=int(n_fast),
         n_slow_days=int(n_slow),
+        target_clock=TARGET_CLOCK,
+        forward_horizon=FORWARD_HORIZON,
+        # Daily IC: end-of-session prediction vs next session's return, the
+        # same outcome for every training target (scoring.py).
+        daily_ic=float(_dic["ic"]),
+        daily_ic_folds=_dic["ic_folds"],
+        daily_ic_n_days=int(_dic["n_days"]),
     )
     print(f"\n  Results saved to {os.path.basename(results_file)}")
 

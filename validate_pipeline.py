@@ -72,6 +72,9 @@ def results_path(mode: str, seed: int) -> str:
         label += f"_src-{source}"
     if os.environ.get("SWITCH_GAPS", "remove").lower() == "keep":
         label += "_gaps-kept"
+    lag = int(os.environ.get("SLOW_FEATURE_LAG", "1"))
+    if lag != 1:
+        label += f"_slowlag{lag}"
     if mode != "none":
         label += f"_null-{mode}"
     if seed != 0:
