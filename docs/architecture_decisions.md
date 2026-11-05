@@ -838,3 +838,49 @@ costs and only describes the IC.
    either. Wait for longer history.
 Log: `data/f1_baselines.log`; table `data/f1_baselines.csv`.
 
+---
+
+## 21. Execution timing: waiting out an adverse book saves a few percent of the spread
+
+*5 November 2026 · Status: measured; small, real, free · Code:
+`exec_timing.py`, `test_exec_timing.py`*
+
+**Question.** Entry 19's book-imbalance signal is far below the spread, so
+it cannot pay for a trade. Can it make a trade we were doing anyway — a
+daily strategy's rebalance — cheaper?
+
+**Method.** Same per-second book (four depth contracts, three sample
+months). A decision every 5 minutes where a quote exists and the spread is
+at most 2 ticks (normal markets; pre-open and thin moments, with spreads up
+to 87 ticks, are not when a daily strategy trades). At each, price a buy and
+a sell of one contract — drift cancels between them — against the mid at
+the decision. Policies: cross now; wait up to W seconds while book
+imbalance leans against us (≤ −θ for a buy, ≥ +θ for a sell), then cross;
+cross at a random second within W (control). Taker orders only — a resting
+order's fill depends on queue position, which this data cannot show.
+
+**Result** (θ = 0.3, wait up to 60 s; saving vs crossing at once, in ticks
+per contract, t across sessions):
+
+| | cost of crossing now | book policy saves | random wait saves | typical wait |
+|---|---|---|---|---|
+| CL | 0.61 | +0.035 (t 2.5) | −0.014 | 1 s |
+| NG | 0.69 | +0.033 (t 11) | −0.002 | 4 s |
+| HG | 0.70 | +0.030 (t 15) | +0.000 | 1 s |
+| ZC | 0.53 | +0.056 (t 35) | +0.001 | 10 s |
+
+- The book policy saves on every contract, every window (10 s–5 min) and
+  both thresholds; waiting at random saves nothing. So the saving is the
+  book's information, not the act of waiting.
+- It is small: about 5% of the half-spread on CL, NG and HG, and about 10%
+  on corn (more with a 5-minute window: 0.075 ticks, 14%). In dollars,
+  roughly $0.30–0.95 per contract per trade.
+- The wait is short — a few seconds on average — so it barely delays the
+  daily strategy.
+
+**Downstream.** Worth having as a free execution rule once there is a daily
+strategy to execute; not a reason to keep the order-flow kernels in the
+prediction model. Piece D, re-aimed at execution, has its first result. A
+fuller version would test resting limit orders, which needs queue position
+(`mbo` data). Log: `data/exec_timing.log`; table `data/exec_timing.csv`.
+

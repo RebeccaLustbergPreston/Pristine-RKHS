@@ -23,6 +23,9 @@ sign but ~378 sessions cannot resolve it (entry 20) — longer daily history
 is the next purchase to consider. D0 caveat: 31 of 85 switches fall on a
 session's first trade, so the removed gap includes a real overnight move;
 fixing it needs the second contract's price (entry 20).
+Execution timing (entry 21): waiting a few seconds while the book leans
+against the trade saves 5–14% of the half-spread on the four depth
+contracts — a free execution rule for whatever daily strategy survives.
 
 ---
 
