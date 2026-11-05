@@ -26,6 +26,10 @@ fixing it needs the second contract's price (entry 20).
 Execution timing (entry 21): waiting a few seconds while the book leans
 against the trade saves 5–14% of the half-spread on the four depth
 contracts — a free execution rule for whatever daily strategy survives.
+F1 on 14 years of settlements (entry 22): no time-varying forecast passes;
+one-day reversal is an artefact of different settlement times; static drift
+tilts (known premia) survive but are allocations, not forecasts. Future
+cross-sectional tests need synchronous prices, not settlements.
 
 ---
 

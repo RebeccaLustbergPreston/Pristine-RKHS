@@ -884,3 +884,65 @@ prediction model. Piece D, re-aimed at execution, has its first result. A
 fuller version would test resting limit orders, which needs queue position
 (`mbo` data). Log: `data/exec_timing.log`; table `data/exec_timing.csv`.
 
+---
+
+## 22. F1 on 14 years of settlements: no timing signal survives; drift tilts are allocations
+
+*5 November 2026 · Status: measured · Code: `pull_daily_history.py`,
+`daily_settlements.py` (both in the databento venv), `f1_long.py`,
+`test_f1.py`*
+
+**Data.** Daily bars and settlement statistics for the front and second
+contract of all eight, June 2010 – December 2024 (bitcoin from November
+2017), same roll rules as the tick data; files and manifests in
+`data/raw/<ROOT>/daily_history/`. Statistics went through batch jobs
+because streaming them ran at minutes per megabyte. Settlement = stat_type
+3, last update per contract per trading date.
+
+**Better measurement than entry 20.** Returns are roll-free: each date's
+return is its front contract's settlement over *the same contract's*
+settlement the date before (from the second-contract file when it was not
+yet front), so no switch gap is ever in a return and no overnight move is
+removed with one. Carry is measured: log(front ÷ second settlement) on the
+same date, annualised by the contract's listing cycle. 3,674 dates with at
+least five contracts; the resolvable IC falls from ±0.04 to about ±0.013.
+
+**Result** (same forecasts, outcome, score and rule as entry 20; halves
+2010–17 and 2018–24):
+
+| forecast | IC | t | IC 2010–17 (t) | IC 2018–24 (t) |
+|---|---|---|---|---|
+| mom21 | +0.004 | 0.6 | −0.009 (−1.0) | +0.018 (1.9) |
+| mom63 | +0.013 | 1.8 | −0.000 (0.0) | +0.027 (2.8) |
+| mom126 | +0.017 | 2.4 | +0.009 (0.9) | +0.025 (2.5) |
+| rev1 | +0.031 | 4.5 | +0.042 (4.2) | +0.019 (2.0) |
+| carry | +0.004 | 0.7 | +0.023 (2.4) | −0.015 (−1.7) |
+| static mom21 | +0.025 | 3.9 | +0.032 (3.4) | +0.018 (2.0) |
+| static carry | +0.015 | 2.4 | +0.027 (2.9) | +0.003 (0.3) |
+
+**Checks on the two that pass.**
+- *One-day reversal is an artefact of settlement times.* The eight settle
+  hours apart (copper ~12:00 Chicago, gold 12:30, corn 13:15, crude and gas
+  13:30, Treasuries 14:00, ES and bitcoin 15:00). News between two
+  settlements reaches one contract today and another tomorrow, which looks
+  exactly like cross-sectional reversal. Among the four that settle within
+  45 minutes (CL, NG, ZC, ZT) it shrinks to +0.016 (t 1.65); among the four
+  spread across the afternoon it is +0.042 (t 3.0); skipping a day it is
+  +0.005 (t 0.7). Not tradeable.
+- *Static tilts are allocations, not forecasts.* The expanding average of
+  momentum or carry is a near-fixed ranking of the contracts by their past
+  drift — equities and gold rose, natural gas futures decayed (contango).
+  It holds in both halves, but among the four synchronous settlers it is
+  +0.004 (t 0.5): it is a few contracts' persistent drift, i.e. known risk
+  premia (equity premium, the cost of carrying contango), captured by
+  holding, not by timing.
+
+**Conclusion.** With 14 years the test has power, and no *time-varying*
+forecast passes: momentum is weak and only in 2018–24, carry flips sign
+between halves, reversal is a timing artefact. What survives is static
+drift — a buy-and-hold tilt toward known premia. That is a legitimate
+portfolio but not a forecasting result, and gives the kernels nothing to
+time. Any future cross-sectional test must use prices sampled at one common
+moment (e.g. 1-minute bars at 12:00 Chicago), not settlements.
+Log: `data/f1_long.log`; table `data/f1_long.csv`.
+

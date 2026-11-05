@@ -93,6 +93,22 @@ def t_carry_from_switches():
     assert np.isclose(c.iloc[110], 0.01 / yrs2)
 
 
+def t_roll_free_returns_and_carry():
+    from f1_long import roll_free
+    d = pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"])
+    t = pd.DataFrame({
+        "date": [d[0], d[0], d[1], d[1], d[2], d[2]],
+        "rank": [0, 1, 0, 1, 0, 1],
+        "instrument_id": [1, 2, 1, 2, 2, 3],          # contract 2 becomes front on d[2]
+        "settle": [70.0, 71.0, 72.0, 73.0, 74.0, 75.0]})
+    rf = roll_free(t)
+    assert np.isnan(rf["ret"].iloc[0])
+    assert np.isclose(rf["ret"].iloc[1], np.log(72 / 70))
+    # Across the roll: contract 2's own move, 73 → 74, not 72 → 74.
+    assert np.isclose(rf["ret"].iloc[2], np.log(74 / 73))
+    assert np.isclose(rf["front_over_second"].iloc[0], np.log(70 / 71))
+
+
 for _n, _f in list(globals().items()):
     if _n.startswith("t_"):
         check(_n[2:], _f)

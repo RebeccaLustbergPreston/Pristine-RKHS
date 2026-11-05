@@ -87,16 +87,22 @@ def carry_signal(dates, sw):
     return out
 
 
-def signals(close, switches):
-    """Every forecast, a dict of DataFrames (sessions × contracts), causal."""
+def signals(close, switches=None, carry=None):
+    """
+    Every forecast, a dict of DataFrames (sessions × contracts), causal.
+    Carry comes from the switch gaps unless a carry table is given
+    (f1_long.py measures it from front and second settlements).
+    """
     lr = np.log(close).diff()
     vol = lr.rolling(VOL_WINDOW).std()               # up to and including d
     sig = {}
     for n in (21, 63, 126):
         sig[f"mom{n}"] = (np.log(close) - np.log(close.shift(n))) / (vol * np.sqrt(n))
     sig["rev1"] = -lr / vol
-    sig["carry"] = pd.DataFrame({s: carry_signal(close.index, switches[s])
-                                 for s in close.columns})[close.columns]
+    if carry is None:
+        carry = pd.DataFrame({s: carry_signal(close.index, switches[s])
+                              for s in close.columns})
+    sig["carry"] = carry.reindex(index=close.index, columns=close.columns)
     for k in list(sig):
         sig[f"static_{k}"] = sig[k].expanding().mean()
     return sig
