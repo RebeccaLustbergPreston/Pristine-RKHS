@@ -30,6 +30,9 @@ F1 on 14 years of settlements (entry 22): no time-varying forecast passes;
 one-day reversal is an artefact of different settlement times; static drift
 tilts (known premia) survive but are allocations, not forecasts. Future
 cross-sectional tests need synchronous prices, not settlements.
+At 1–5 minutes (entry 23) the features forecast realised volatility beyond
+the HAR benchmark on all four depth contracts; direction stays below cost; a
+linear model beats the kernel.
 
 ---
 

@@ -946,3 +946,71 @@ time. Any future cross-sectional test must use prices sampled at one common
 moment (e.g. 1-minute bars at 12:00 Chicago), not settlements.
 Log: `data/f1_long.log`; table `data/f1_long.csv`.
 
+---
+
+## 23. At 1–5 minutes the features forecast volatility beyond the standard benchmark; direction stays below cost
+
+*5 November 2026 · Status: measured · Code: `minute_check.py`,
+`test_minute_check.py`*
+
+**Question.** Put the pipeline's kind of features on a short clock. Do they
+forecast the next 1–5 minutes' direction or volatility, and does a flexible
+(kernel) model beat a linear one?
+
+**Method.** 1-minute bars from the per-second book (entry 19; CL, NG, HG,
+ZC; three sample months, 75–86 sessions, 80–90k bars each). Fifteen causal
+features: book and top-five depth imbalance, order-flow imbalance and signed
+trade flow over 1 and 5 minutes, past mid moves, a VPIN-style flow
+imbalance and a Kyle's-lambda-style price impact over 30 minutes, a
+Hawkes-style trade-intensity burst, realised variance over 1, 5 and 30
+minutes, the spread. Walk-forward by session (expanding from 30% of
+sessions, refit every 5, standardised on training rows). Models: RidgeCV,
+and random Fourier features of an RBF kernel + RidgeCV (the pipeline's kind
+of kernel). Volatility benchmark: HAR (Corsi 2009) — ridge on 1/5/30-minute
+realised variance — plus hour of day, which every volatility model also
+gets, so "beyond HAR" isolates the order-flow features. Scores: per-session
+Spearman IC on non-overlapping origins, t across sessions; "beyond" is the
+rank partial correlation after removing the benchmark from forecast and
+outcome. Tests include a causality check and a planted signal.
+
+**Direction** (IC, t; edge = ticks per round trip on each session's
+top/bottom 10%, against a ~1-tick cost):
+
+| | book alone, 1 min | ridge, 1 min | kernel, 1 min | book alone, 5 min | ridge, 5 min |
+|---|---|---|---|---|---|
+| CL | +0.084 (8), 0.27 | +0.061 (11), 0.21 | +0.080 (7), 0.32 | +0.028 (2), 0.14 | +0.015 (1), −0.22 |
+| NG | +0.067 (12), 0.19 | +0.066 (12), 0.19 | +0.065 (12), 0.18 | +0.016 (1), 0.28 | +0.032 (3), 0.19 |
+| HG | +0.089 (16), 0.32 | +0.089 (18), 0.31 | +0.078 (15), 0.26 | +0.040 (4), 0.37 | +0.030 (3), 0.17 |
+| ZC | +0.248 (41), 0.27 | +0.248 (40), 0.27 | +0.232 (33), 0.25 | +0.164 (15), 0.33 | +0.154 (14), 0.33 |
+
+Fifteen features and a kernel add nothing over book imbalance alone, and
+every edge is a third of the cost or less.
+
+**Volatility** (next-h log realised variance; IC, then rank partial beyond
+the HAR benchmark with t):
+
+| | HAR, 1 min | ridge, 1 min (beyond HAR) | kernel, 1 min (beyond HAR) | HAR, 5 min | ridge, 5 min (beyond HAR) | kernel, 5 min (beyond HAR) |
+|---|---|---|---|---|---|---|
+| CL | 0.780 | 0.782 (+0.089, t 6) | 0.697 (+0.078, t 15) | 0.883 | 0.886 (+0.169, t 18) | 0.795 (+0.132, t 13) |
+| NG | 0.700 | 0.706 (+0.128, t 20) | 0.629 (+0.057, t 9) | 0.801 | 0.810 (+0.202, t 18) | 0.731 (+0.122, t 9) |
+| HG | 0.767 | 0.767 (+0.110, t 13) | 0.575 (+0.041, t 6) | 0.854 | 0.862 (+0.217, t 20) | 0.677 (+0.041, t 4) |
+| ZC | 0.458 | 0.472 (+0.131, t 30) | 0.420 (+0.095, t 15) | 0.669 | 0.673 (+0.095, t 8) | 0.612 (+0.121, t 9) |
+
+- Short-term volatility is very forecastable, and the HAR benchmark already
+  gets most of it (IC 0.46–0.88).
+- The order-flow features carry real information beyond HAR on all four
+  contracts at both horizons (partial +0.09 to +0.22, t 6–30). In plain IC
+  the gain is small (+0.00 to +0.01) — they refine, they do not transform.
+- The kernel model is worse than ridge in plain IC on every row and adds
+  less beyond HAR on most: with these sample sizes the flexibility costs
+  more than it finds.
+
+**Conclusion.** This is the first place in the project where the features
+earn their keep: they improve a standard volatility forecast at 1–5
+minutes. It is a market-making or options-hedging input (sizing quotes,
+hedging gamma), not a directional strategy, and the linear model is enough
+— the kernel is not justified even here. Together with entries 19–22: the
+features' information is real, short-horizon and about volatility; nothing
+in this data supports a daily directional strategy. Log:
+`data/minute_check.log`; table `data/minute_check.csv`.
+
