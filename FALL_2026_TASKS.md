@@ -79,7 +79,11 @@ step 7 has a score that tells real results from shuffled ones.
    reproduces the pre-refactor runs exactly (41 arrays, two seeds); all eight
    contracts run end to end (`SYMBOL=`). Decision log entry 14.
 5. **D2**, bar size per contract by rule (waits on step 2).
-6. **Book features from depth** (piece D) for CL, NG, HG, ZC — streamed from
+6. *5 November (decision log entry 19): at the best quotes, book imbalance
+   predicts the mid strongly from 1 s to ~1 min on all four depth contracts
+   and is gone by 30 min; below the spread for a taker. Re-aim piece D at
+   execution timing for the daily strategy, not at daily prediction.*
+   **Book features from depth** (piece D) for CL, NG, HG, ZC — streamed from
    the raw `mbp-10` files into the `.npz` layout in the cleaning standard,
    never loaded as a table.
 7. **E0, then E1 and E3.** E3 passing is the gate for everything after it.

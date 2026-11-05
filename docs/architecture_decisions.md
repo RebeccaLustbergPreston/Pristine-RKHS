@@ -721,3 +721,60 @@ this data. Tuning model capacity cannot fix that. F1 (section F of
 `FALL_2026_TASKS.md`) starts from known premia for this reason; the features
 are tested there only as an overlay.
 
+---
+
+## 19. Order-book signal exists at seconds, gone by 30 minutes, not tradeable as a taker
+
+*5 November 2026 · Status: measured · Code: `depth_seconds.py` (runs in the
+databento venv), `horizon_check.py`, `test_horizon_check.py`*
+
+**Question.** Entries 11–18 found no daily signal. Do the order-flow and
+book features carry information at all, just at a shorter horizon than we
+asked about?
+
+**Method.** Three sample months (Aug 2023, Feb 2024, Aug 2024) of `mbp-10`
+depth for the four contracts that have it (CL, NG, HG, ZC), streamed into
+one row per second (best quotes, sizes, top-five depth, Cont–Kukanov–Stoikov
+order-flow imbalance, signed trade flow). At each horizon h from 1 s to 30
+min, non-overlapping origins; features from (t−h, t] only; outcome the
+**mid**-price move over (t, t+h] in ticks (trade prices bounce between bid
+and ask and manufacture predictability). No window crosses a gap over 60 s
+or a contract switch. Per-session Spearman IC, t-stat across sessions.
+Tests include a look-ahead check: flow that moves the price only in the same
+second must score ~0 as a forecast. The CL depth is the `CL.c.0` roll, not
+`CL.v.0`; irrelevant within a session.
+
+**Result** (book imbalance = (bid size − ask size) / (bid size + ask size) at
+the best quotes; IC with the next-h mid move, t-stat in brackets):
+
+| h | CL | NG | HG | ZC |
+|---|---|---|---|---|
+| 1 s | +0.18 (26) | +0.12 (49) | +0.18 (41) | +0.12 (74) |
+| 10 s | +0.12 (18) | +0.13 (41) | +0.15 (27) | +0.22 (91) |
+| 1 min | +0.05 (6) | +0.08 (15) | +0.08 (16) | +0.22 (43) |
+| 5 min | +0.03 (4) | +0.02 (2) | +0.05 (4) | +0.14 (16) |
+| 30 min | +0.04 (2) | +0.01 (0) | +0.03 (2) | +0.02 (1) |
+
+- **Book imbalance predicts the mid, strongly, from 1 s to ~1 min** on all
+  four contracts, and decays to nothing by 30 min. Top-five depth imbalance
+  shows the same at about half the size.
+- **Past order-flow imbalance and trade flow barely predict** (|IC| ≤ 0.05).
+  They explain the move *as it happens* (same-window IC 0.6–0.9, the
+  plumbing check) — the textbook result — but not the next one.
+- **Short-term mid reversal**: the last h seconds' move predicts a small
+  opposite move (IC −0.03 to −0.10).
+- **Not tradeable by crossing the spread.** Trading the top/bottom 10% of
+  book imbalance earns 0.1–0.4 ticks of mid move on average; the median
+  spread is 1 tick, so a taker loses ~0.6–0.9 ticks per round trip before
+  fees. This is the information market makers use to decide which side to
+  quote and when to pull a quote, not a directional strategy.
+
+**Conclusion.** The features are not empty — they are informative at a
+horizon of seconds and decay well before the daily horizon the pipeline
+trades, which is why entries 11–18 found nothing. For the club: (1) the
+daily RKHS strategy should not expect order-flow features to help; (2) the
+honest use of the depth data is execution — timing entries of a daily
+strategy (piece D could test whether waiting for favourable book imbalance
+saves part of the spread); (3) the slow kernels' daily nulls stand on their
+own. Log: `data/horizon_check.log`; table `data/horizon_check.csv`.
+
