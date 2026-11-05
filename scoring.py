@@ -131,3 +131,35 @@ def daily_vol_ic(pred, bar_idx, bar_day, day_close, trailing: int = 20,
             "partial_abs1": partial(p, abs1), "partial_rv5": partial(p, rv5),
             "baseline_ic_abs1": ic(base, abs1), "baseline_ic_rv5": ic(base, rv5),
             "n_days": int(len(d))}
+
+
+# ── Cross-sectional forecasts (F1) ───────────────────────────────────────────
+
+def cross_sectional_ic(forecast: pd.DataFrame, outcome: pd.DataFrame,
+                       min_names: int = 5) -> dict:
+    """
+    How well a forecast ranks contracts against each other.
+
+    forecast, outcome : sessions × contracts, the forecast known at the
+                        session's close and the outcome that follows it.
+    Per session, the Spearman correlation across the contracts that have
+    both (at least ``min_names``); then the mean over sessions, with a
+    t-stat from the spread of the per-session values. Shuffling which
+    contract each forecast belongs to has mean zero, so t measures distance
+    from that null.
+    """
+    f, y = forecast.align(outcome, join="inner")
+    ok = f.notna() & y.notna()
+    fr = f.where(ok).rank(axis=1)
+    yr = y.where(ok).rank(axis=1)
+    keep = ok.sum(axis=1) >= min_names
+    fr, yr = fr[keep], yr[keep]
+    fc = fr.sub(fr.mean(axis=1), axis=0)
+    yc = yr.sub(yr.mean(axis=1), axis=0)
+    den = np.sqrt((fc ** 2).sum(axis=1) * (yc ** 2).sum(axis=1))
+    ic = ((fc * yc).sum(axis=1) / den.where(den > 0)).dropna()
+    n = len(ic)
+    if n < 3:
+        return {"ic": float("nan"), "t": float("nan"), "n": n, "daily": ic}
+    return {"ic": float(ic.mean()), "t": float(ic.mean() / ic.std(ddof=1) * np.sqrt(n)),
+            "n": n, "daily": ic}

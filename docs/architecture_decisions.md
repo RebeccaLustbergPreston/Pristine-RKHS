@@ -778,3 +778,63 @@ strategy (piece D could test whether waiting for favourable book imbalance
 saves part of the spread); (3) the slow kernels' daily nulls stand on their
 own. Log: `data/horizon_check.log`; table `data/horizon_check.csv`.
 
+---
+
+## 20. F1 rule baselines: momentum has the right sign, the sample is too short
+
+*5 November 2026 · Status: measured; no forecast passes the fixed rule ·
+Code: `f1.py`, `scoring.cross_sectional_ic`, `test_f1.py`*
+
+**Method.** Each session, rank the eight contracts by a causal forecast;
+the outcome is each contract's next-session return over its trailing
+20-session volatility (so the volatile contracts do not own the extreme
+ranks). Score: Spearman IC across contracts per session, averaged, t-stat
+across sessions (378 shared sessions; the within-session shuffled null has
+mean zero). Rule fixed in advance: a forecast counts only at t ≥ 2.
+Forecasts: vol-scaled 21/63/126-session momentum, one-day reversal, carry
+from the switch gaps, and the expanding average of each ("static": a fixed
+tilt rather than timing). The rank-weighted long–short Sharpe is gross of
+costs and only describes the IC.
+
+**Result.**
+
+| forecast | mean IC | t | L/S Sharpe (gross) |
+|---|---|---|---|
+| mom21 | +0.037 | 1.78 | 1.61 |
+| mom63 | +0.024 | 1.06 | 1.17 |
+| mom126 | +0.032 | 1.24 | 0.72 |
+| rev1 | +0.008 | 0.37 | 0.07 |
+| carry (switch gaps) | −0.015 | −0.66 | 0.12 |
+| static mom126 | +0.059 | 2.18 | 1.53 |
+
+- Momentum is positive at every lookback, at the size the literature
+  reports (cross-sectional ICs of a few hundredths), but no single lookback
+  reaches t = 2. With ~378 sessions the resolvable IC is about ±0.04: the
+  sample is too short to confirm an effect of the known size.
+- Static mom126 crosses t = 2, but it is one of ten forecasts (a
+  multiple-testing bar is about t = 2.8), and a fixed tilt toward the
+  contracts that rose over this particular 18 months (bitcoin, gold,
+  equities in 2023–24) is a description of the sample, not a forecast. It
+  does not count.
+- Carry from switch gaps shows nothing, and is a weak measurement: 31 of the
+  85 switches happen at a session's first trade, so their gap includes the
+  overnight move as well as the term spread.
+
+**Downstream.**
+1. The binding constraint for F1 is history, not modelling. Daily
+   settlement prices for the eight contracts over 15–20 years would resolve
+   ICs of ±0.01 and are cheap (Databento `ohlcv-1d` or `statistics` on the
+   continuous symbols) — a purchase, so Rebecca's call. Those runs need no
+   ticks.
+2. Proper carry needs the second contract's price at the same moment
+   (settlements for `.v.1`/`.n.1`); the same purchase could include it.
+3. **D0 caveat found here:** when a switch happens at a session's first
+   trade (31 of 85), the gap D0 removes includes a real overnight move, so
+   one genuine session return per such switch is removed with the roll.
+   Fixing it also needs the second contract's price at the old contract's
+   last trade. Logged in `TODO.md`.
+4. The kernels, as an F1 overlay, would be tested against mom21 — but with
+   the base effect itself unresolved on this sample, that test has no power
+   either. Wait for longer history.
+Log: `data/f1_baselines.log`; table `data/f1_baselines.csv`.
+

@@ -17,6 +17,13 @@ volatility beyond trailing volatility, absolute or relative (decision log
 entries 11, 16 and 17). Plain ridge on the same features finds nothing
 either (entry 18): the features, not the model's flexibility, are the limit.
 
+**5 November 2026:** order-book imbalance predicts the mid at seconds and is
+gone by 30 minutes (entry 19). F1 rule baselines: momentum has the right
+sign but ~378 sessions cannot resolve it (entry 20) — longer daily history
+is the next purchase to consider. D0 caveat: 31 of 85 switches fall on a
+session's first trade, so the removed gap includes a real overnight move;
+fixing it needs the second contract's price (entry 20).
+
 ---
 
 ## 1. Remove the fake contract-switch moves from the CL target — done
