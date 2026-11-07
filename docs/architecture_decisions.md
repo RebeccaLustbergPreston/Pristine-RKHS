@@ -1014,3 +1014,41 @@ features' information is real, short-horizon and about volatility; nothing
 in this data supports a daily directional strategy. Log:
 `data/minute_check.log`; table `data/minute_check.csv`.
 
+---
+
+## 24. Volatility ripples: the clock, the echo, and scheduled reports
+
+*7 November 2026 · Status: measured · Code: `vol_ripples.py`*
+
+**What.** Three descriptions of 1-minute realised variance on the four depth
+contracts (three sample months): its average by half-hour of the Chicago
+day; its autocorrelation at lags of 1 minute to 4 hours, with and without
+each minute-of-day's mean removed; and crude's variance minute by minute
+around the Wednesday 9:30 Chicago EIA inventory release, against the same
+minute on other weekdays.
+
+**Expiry days excluded.** CL's depth follows the calendar roll (`CL.c.0`),
+so it holds the expiring contract through its last session, when the book
+empties (spread up to $5.72). Three such afternoons made the 13:00 slot read
+17× average; each contract's final session before a switch is now dropped
+(it reads 2×). Earlier book-based results (entries 19, 21, 23) include those
+few sessions; their rank-based, per-session scores are not driven by them,
+but this is the cleaner rule for future work.
+
+**Result.**
+- *Clock:* variance runs 2–5× average from 7:30 to 10:00 Chicago; gas has a
+  second peak at its Thursday 9:30 storage report, corn at 8:30 (open) and
+  11:00 (USDA reports), crude and gas about 2× in the settlement window.
+  Copper also peaks in the London morning and the Asian evening.
+- *Echo:* with the clock removed, 1-minute autocorrelation is 0.21–0.39,
+  falling fast over five minutes, with a tail of about 0.17 at four hours on
+  copper and corn (crude 0.07, gas 0.02). Without removing the clock the
+  echo looks about twice as strong.
+- *EIA:* the release minute is 9.6× normal, the next two about 3×, then
+  1.5–2× for 15–30 minutes; the half-hour before runs below normal.
+  Thirteen Wednesdays, so the multiples are rough.
+
+**Downstream.** Explains why HAR forecasts minutes so well (fast drop, long
+tail) and supports an execution rule of not trading in the minutes after a
+scheduled release. Outputs: `data/vol_ripples_{clock,echo,event}.csv`.
+
