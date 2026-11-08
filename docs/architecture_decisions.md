@@ -1052,3 +1052,219 @@ but this is the cleaner rule for future work.
 tail) and supports an execution rule of not trading in the minutes after a
 scheduled release. Outputs: `data/vol_ripples_{clock,echo,event}.csv`.
 
+
+---
+
+## 25. Volatility spills over between markets, with equities as the hub; gas and corn stand apart
+
+*7 November 2026 · Status: measured · Code: `spillover.py`, `test_spillover.py`*
+
+**Question.** Does one market's recent volatility help forecast another's
+over the next 1 and 5 minutes, beyond the target's own history?
+
+**Method.** Cleaned 1-minute bars for all eight contracts, 8:30–13:15
+Chicago (the hours all eight trade), on the 305 dates all eight trade.
+Minute variance is the Parkinson range estimator. For each target B,
+walk-forward by date: ridge on B's own 1/5/30-minute log variance and the
+half-hour of day (the HAR benchmark), against the same plus the other seven
+contracts' 1- and 5-minute variance. Score: per-date rank partial
+correlation of the cross forecast with the outcome beyond the own forecast,
+t across dates; then one leader at a time. Expiry sessions dropped (entry
+24). The floor added before taking logs comes from the first five
+(never-scored) dates only — a full-sample median was caught by the
+causality test.
+
+**Result** (beyond own HAR; t):
+
+| | 1 min, all others | strongest leader | 5 min, all others | strongest leader |
+|---|---|---|---|---|
+| CL | +0.051 (12.4) | ES | +0.094 (9.5) | ES |
+| NG | +0.007 (1.4) | ZT (t 2.3) | +0.025 (2.4) | GC (t 2.9) |
+| HG | +0.064 (13.2) | ES | +0.118 (12.3) | GC |
+| GC | +0.068 (15.6) | ES | +0.109 (11.4) | ES |
+| ZC | +0.010 (1.7) | NG (t 1.8) | +0.013 (1.4) | ZT (t 2.4) |
+| ZT | +0.038 (6.4) | ES | +0.076 (8.7) | ES |
+| ES | +0.043 (9.9) | ZT | +0.056 (5.6) | HG |
+| BTC | +0.024 (5.7) | GC | +0.039 (4.3) | GC |
+
+- Volatility does travel between markets: six of eight contracts get real
+  information from the others (t 4–16), and the S&P future is the most
+  frequent leader.
+- Natural gas and corn are largely their own markets: neither passes at
+  1 minute, and at 5 minutes each has one weak leader just past t = 2.
+
+**Caveat on size.** Partial correlations show that new information exists;
+they overstate how much a forecast improves (entry 28 measured both on the
+kernel: partial +0.10 to +0.18, plain IC +0.002 to +0.014). Read the
+numbers above as "present and ordered", not as forecast gains.
+
+**Downstream.** For a multi-market volatility model, ES and GC are the
+inputs worth adding to metals, crude and rates; gas and corn need their own
+drivers (weather, storage, USDA). Outputs: `data/spillover_{all,pairs}.csv`,
+`data/spillover.log`.
+
+---
+
+## 26. Implied volatility beats our order flow at the daily horizon; order flow still adds at five days
+
+*7 November 2026 · Status: measured · Code: `implied_vol.py`,
+`vol_vs_implied.py`*
+
+**Question.** At the daily horizon, where entries 11–18 found nothing
+beyond trailing volatility, does the options market already know what our
+features know?
+
+**Method.** Crude's daily at-the-money implied volatility from LO option
+settlements (Databento statistics): forward by put–call parity, Black-76
+on the ATM straddle, nearest option month with at least 20 days left.
+Option expiry is computed from CME's rules (futures last trade 3 business
+days before the 25th, options 3 business days before that); this was
+first written as 1 day and corrected after checking all 18 option months
+in the file. 379 dates, median 29.3%. Target: crude's log realised
+variance over the next 1 and next 5 sessions (Parkinson, from cleaned
+1-minute bars, expiry sessions dropped). Walk-forward ridge, label-horizon
+purge: HAR; HAR + implied; HAR + implied + end-of-session order-flow
+summaries from the per-second book.
+
+**Result** (360 sessions; no-skill s.e. ≈ 0.068):
+
+| | next session IC | beyond the previous model | next 5 sessions IC | beyond the previous model |
+|---|---|---|---|---|
+| HAR | 0.786 | | 0.714 | |
+| + implied | 0.801 | +0.249 | 0.744 | +0.301 |
+| + order flow | 0.799 | +0.081 (≈1.2 s.e.) | 0.757 | +0.211 (≈3.1 s.e.) |
+| implied alone | 0.733 | | 0.723 | |
+
+**Conclusion.** Implied volatility is the strongest single addition to HAR
+at both horizons. Order flow adds nothing measurable for the next session
+once implied is in, but does add for the next five sessions (plain IC
+0.744 → 0.757). One market, 18 months: suggestive, not settled. It fits
+entries 23 and 29 — what order flow knows about volatility is mostly
+short-lived — and suggests that a daily volatility product should start
+from implied volatility.
+
+---
+
+## 27. The 1–5 minute results hold on 18 months
+
+*7 November 2026 · Status: measured · Code: `minute_check.py --step 20`*
+
+**What changed.** Entry 23 used three sample months. With the full
+18 months of depth (72 files, entry 19), the same test was run on 360k–530k
+minute bars per contract. Refit interval raised from 5 to 20 sessions: at
+5, each refit retrains on all earlier sessions, so cost grows with the
+square of the sample (a first attempt ran two hours without finishing).
+The models are unchanged, only refreshed less often.
+
+**Result.**
+- *Direction:* book imbalance alone matches ridge and kernel. 1-minute IC
+  +0.065 to +0.068 on CL, NG, HG (t 17–30), +0.26 on ZC (t 89); 5-minute
+  +0.02 to +0.03, ZC +0.17. Edge 0.1–0.3 ticks per round trip against a
+  ~1-tick cost — unchanged.
+- *Volatility:* ridge on the features beats HAR on every contract at both
+  horizons, partial +0.07 to +0.21 (t 17–59), the same range as on three
+  months.
+- *Untuned kernel:* still below ridge in plain IC on every row.
+
+**Conclusion.** Entry 23's findings were not an artifact of a small sample.
+Outputs: `data/minute_check_full.{log,csv}`.
+
+---
+
+## 28. Kernel retest: a tuned kernel helps, but "beyond ridge" overstates by far
+
+*7 November 2026 · Status: measured · Code: `kernel_retest.py`,
+`kernel_paired.py` (+ tests)*
+
+**Question.** With six times the data, does a kernel model beat ridge?
+Rule fixed before running: a kernel model earns a place for a target only
+if it adds beyond ridge with t ≥ 2 on at least 3 of 4 contracts.
+
+**Method.** Same features and walk-forward as entry 27 (refit every 20
+sessions). Models: ridge; untuned RBF kernel (400 random features); tuned
+kernel (1,000 features; γ and penalty chosen on the last 20% of each
+training window); hybrid (ridge plus a tuned kernel fitted to ridge's
+residuals). Kernels train on at most 120,000 evenly spaced rows.
+
+**Result by the rule.** Tuned and hybrid pass on 1- and 5-minute volatility
+(4/4 contracts each, partial +0.10 to +0.18, t 20–54) and on 1-minute
+direction (3/4, partial +0.005 to +0.02). Nothing passes on 5-minute
+direction.
+
+**Why that is not the end.** The *untuned* kernel also "passed" on
+volatility (t 12–33) although its IC is far below ridge's everywhere
+(e.g. copper 0.59 vs 0.79), and the hybrid's IC was only 0.000–0.014 above
+ridge's. So a second check, written before looking further:
+- *paired:* per session, IC(model) − IC(ridge) on the same minutes; t
+  across sessions. This asks whether the forecast is better.
+- *placebo:* a second ridge fitted on the kernels' thinned rows. It holds
+  no new information; its partial-beyond-ridge was −0.002 to +0.009, so
+  the metric does not reward a copy of ridge.
+
+Paired IC gain of the hybrid over ridge: CL +0.003 (5 min; 1 min −0.002,
+n.s.), NG +0.003/+0.004, HG +0.003/+0.002, ZC +0.014/+0.006 — significant
+on 7 of 8 rows (t 6.7–19).
+
+**Conclusion.** The tuned kernel finds something ridge misses, but the gain
+is roughly 1/30 of what the partial correlation implies. A forecast that
+differs from ridge in shape gets credit from the partial correlation for
+the shape, not just for new information. **Rule for future work:** a
+model's improvement over a baseline is reported as the paired IC
+difference; partial correlations may show that information exists but are
+not quoted as its size. Tuning chose the smoothest γ on offer almost every
+time, which led to entry 29. Outputs: `data/kernel_retest.{log,csv}`,
+`data/kernel_paired.{log,csv}`.
+
+---
+
+## 29. A fairly set-up kernel improves short-term volatility forecasts on every contract; gains level off after about a year
+
+*7 November 2026 · Status: measured; supersedes the kernel conclusion of
+entry 23 · Code: `kernel_fair.py`, `test_kernel_fair.py`*
+
+**Context.** Entry 28's kernel kept choosing the smoothest setting. Three
+flaws in its setup could have forced that:
+1. *Hour of day.* 24 standardised one-hot columns (about ±4.8 each) outweighed
+   all 15 order-flow features in the kernel's distances, so only a very
+   smooth, near-linear kernel avoided treating each hour as separate.
+2. *Too few random features* (1,000), which make sharp kernels look noisy
+   in tuning.
+3. *Heavy-tailed features,* which let a few extreme minutes dominate RBF
+   distances.
+
+**Decision.** Kernel inputs are the 15 features, clipped at the training
+window's 0.5/99.5 percentiles and standardised, plus sin/cos of time of
+day; the hour's one-hot columns stay in ridge only. Ridge gets the same
+clipped features, so the comparison stays fair. 4,000 random features
+(2,000 while tuning), computed in chunks so every training row is used;
+γ grid extended ten times smoother. Hyperparameters tuned once per refit
+(every 40 sessions) on the most recent 60,000 rows of ridge residuals.
+Learning curve: ridge and hybrid each trained on the last 60, 120, 240
+sessions and all history, scored on the same rows by paired IC gain.
+
+**Result** (hybrid − ridge, paired per-session IC; t):
+
+| | 1 min: 60 / 120 / 240 / all | 5 min: 60 / 120 / 240 / all |
+|---|---|---|
+| CL | +0.0015 / +0.0020 / +0.0028 / **+0.0029** (9.9) | +0.0029 / +0.0034 / +0.0037 / **+0.0037** (10.5) |
+| NG | +0.0027 / +0.0037 / +0.0042 / **+0.0043** (18.9) | +0.0031 / +0.0037 / +0.0040 / **+0.0041** (12.8) |
+| HG | +0.0035 / +0.0044 / +0.0049 / **+0.0049** (12.8) | +0.0017 / +0.0023 / +0.0029 / **+0.0029** (13.1) |
+| ZC | +0.0178 / +0.0197 / +0.0189 / **+0.0190** (25.1) | +0.0041 / +0.0056 / +0.0059 / **+0.0072** (9.8) |
+
+- The hybrid beats ridge on all 8 rows (t 9.8–25.1); crude at 1 minute,
+  negative in entry 28, is now positive. Gains are 20–60% larger than
+  entry 28's.
+- Tuning now mostly chooses medium sharpness (γ × 0.3–1), rarely the new
+  smoothest values. The flattening was the setup, and there is real
+  curvature in how order flow relates to the next minutes' volatility.
+- Gains rise from 3 to about 12 months of history and then level off;
+  only corn at 5 minutes is still rising. Caveat: early in the test there
+  is less than 240 sessions of history, so "240" and "all" coincide there.
+
+**Conclusion.** The kernels have a measured use: layered on the linear
+model, a properly set-up RBF kernel improves 1–5 minute volatility
+forecasts on all four depth contracts. The gain is small (IC +0.003 to
++0.005; corn +0.007 to +0.019) and statistically solid. On this evidence a
+longer history would add little for CL, NG and HG; corn might still
+benefit. The kernels still add nothing to direction (entry 28), and
+direction remains below cost (entry 27). Output: `data/kernel_fair.{log,csv}`.
