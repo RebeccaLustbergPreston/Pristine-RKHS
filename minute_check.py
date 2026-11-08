@@ -122,13 +122,23 @@ def features(b: pd.DataFrame, tick: float) -> pd.DataFrame:
     return pd.concat(out, ignore_index=True)
 
 
+STEP = 5
+
+
 def _hours(df):
     h = ((df["minute"].to_numpy() // 60) % 24).astype(int)
     return np.eye(24)[h]
 
 
-def walk_forward(df, ycol, kind, start_frac=0.3, step=5, seed=0, cols=FEATURES, hours=False):
-    """Out-of-sample forecasts per row, by session blocks; NaN where none."""
+def walk_forward(df, ycol, kind, start_frac=0.3, step=None, seed=0, cols=FEATURES, hours=False):
+    """Out-of-sample forecasts per row, by session blocks; NaN where none.
+
+    Refits every ``step`` sessions (default STEP). Each refit uses every earlier
+    session, so cost grows with the square of the sample: 18 months at a 5-session
+    step is ~30x the three-month run. A 20-session step (as kernel_retest.py)
+    keeps it to an hour or two.
+    """
+    step = STEP if step is None else step
     X = df[list(cols)].to_numpy(float)
     if hours:
         X = np.hstack([X, _hours(df)])
@@ -240,7 +250,11 @@ def report(symbol):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--symbols", default="CL,NG,HG,ZC")
+    ap.add_argument("--step", type=int, default=5, help="sessions between refits")
     a = ap.parse_args(argv)
+    global STEP
+    STEP = a.step
+    print(f"Refit every {STEP} sessions.")
     print("Per-session rank IC (t across sessions). Direction edge: ticks per round trip")
     print("in the forecast's direction, top/bottom 10%; crossing costs about one spread.")
     rows = []
