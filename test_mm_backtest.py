@@ -139,6 +139,52 @@ def test_no_position_crosses_a_session():
     assert (np.cumsum(f[1])[np.isin(f[0], [2])] == 0).all()
 
 
+def _delayed(bids, asks, delay, bid_ok=True, ask_ok=False):
+    b, a, bs, as_, sg = _book(bids, asks)
+    n = len(b)
+    return mm.simulate(b, a, bs, as_, sg, np.full(n, bid_ok), np.full(n, ask_ok), "through",
+                       1000, delay=delay)
+
+
+def test_stale_bid_is_picked_off():
+    # touch 104/106 until second 3, then 103/105. Seeing 3 s late, at second 6
+    # we bid 104: above the real bid, below the real ask. It rests there as the
+    # best bid and is filled at 104 the next second, although the market has
+    # not moved since second 4
+    bids = np.array([104, 104, 104, 104, 103, 103, 103, 103, 103])
+    asks = bids + 2
+    n = len(bids)
+    allow = np.r_[np.zeros(3, bool), np.ones(n - 3, bool)]
+
+    def run(d):
+        return mm.simulate(bids, asks, np.full(n, 10.0), np.full(n, 10.0), np.zeros(n, int),
+                           allow, np.zeros(n, bool), "through", 1000, delay=d)
+    f = run(3)
+    assert (f[0][0], f[1][0], f[2][0], f[3][0]) == (7, 1, 104, 0), f
+
+
+def test_stale_bid_crossing_the_ask_buys_at_the_ask():
+    # touch 104/105 until second 3, when we are first allowed to bid; the
+    # market falls to 100/101 at second 4. Seeing 3 s late, at second 6 we
+    # bid 104, which crosses the real ask: we buy there, at 101
+    bids = np.array([104, 104, 104, 104, 100, 100, 100, 100])
+    asks = bids + 1
+    n = len(bids)
+    allow = np.array([False, False, False, True, True, True, True, True])
+    f = mm.simulate(bids, asks, np.full(n, 10.0), np.full(n, 10.0), np.zeros(n, int),
+                    allow, np.zeros(n, bool), "through", 1000, delay=3)
+    assert (f[0][0], f[1][0], f[2][0]) == (6, 1, 101), f
+
+
+def test_delay_needs_through_rule():
+    b = _book([100, 100], [101, 101])
+    try:
+        mm.simulate(*b, np.ones(2, bool), np.ones(2, bool), "queue", 10, delay=1)
+    except ValueError:
+        return
+    raise AssertionError("queue rule accepted a delay")
+
+
 if __name__ == "__main__":
     print("mm_backtest tests:")
     for name, fn in list(globals().items()):

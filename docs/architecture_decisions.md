@@ -1374,3 +1374,60 @@ queue position; one lot; fees assumed. Output:
 `data/mm_backtest.{log,csv}`, `data/mm_sessions_<SYM>.csv`,
 `data/mm_suite_check.{log,csv}`, `data/mm_scorecard.{log,csv}`,
 `data/mm_equity.csv`.
+
+## 31. Speed, queue position and fees: what the market-making backtest says a firm would need
+
+*8 November 2026 · Status: measured · Code: `mm_latency.py`,
+`test_mm_latency.py`, `simulate(..., delay=)` in `mm_backtest.py` (run
+logged in `data/mm_latency.log`, mm_latency.py sha256 e80f8b5…)*
+
+**Context.** Entry 30: the volatility forecast cuts a passive quoter's
+losses by 70–85% but no policy pays after fees. The question for the
+final presentation is what a well-funded firm would need to make it pay.
+
+**Decision.** (1) *Speed:* rerun entry 30's quoting (always, and the
+forecast gate; pessimistic "through" rule) with our view of the book and
+the policy's flags delayed by 0, 1, 2, 5, 10 and 30 seconds, while fills
+happen against the real book. Reaction time is 1 s plus the delay. A
+stale bid above the real best bid is picked off at its price the next
+second; a stale bid at or above the real ask buys at that ask (asks
+symmetric). With no delay the simulator is unchanged: checked equal to the
+committed version on 40 random books, and covered by tests. The queue rule
+is not defined with a delay. (2) *Fees and queue position:* from entry
+30's results, the fee per side at which each policy breaks even
+(`data/mm_breakeven.csv`), and a bridge from quoting blind to the best case
+the data allows: + forecast, + front of the queue (optimistic rule),
++ no fees.
+
+**Result.**
+
+| | gated loss per fill, 1 s → 31 s (ticks) | gated loss per session, 1 s → 2 s | blind loss per fill, 1 s → 31 s | best case (gate, front of queue, no fees) | break-even fee, gate at front of queue |
+|---|---|---|---|---|---|
+| CL | −0.182 → −0.268 (+47%) | −$6,450 → −$8,950 (+39%) | −0.327 → −0.333 | +$145 | $0.04 |
+| NG | −0.237 → −0.269 (+14%) | −$2,546 → −$3,428 (+35%) | −0.370 → −0.378 | −$466 | needs a $0.49 rebate |
+| HG | −0.129 → −0.233 (+81%) | −$6,058 → −$9,010 (+49%) | −0.192 → −0.289 | +$2,497 | $0.74 |
+| ZC | −0.253 → −0.283 (+12%) | −$626 → −$806 (+29%) | −0.249 → −0.311 | +$350 | $1.17 |
+
+- Slower reaction makes every gated fill more expensive on all four
+  contracts, and the forecast's advantage shrinks (crude: 0.145 ticks per
+  fill better than blind at 1 s, 0.065 at 31 s). The curve is steepest at
+  the fast end: 1 → 2 s costs 29–49% more per session. Below 1 s cannot be
+  measured with one snapshot a second.
+- Net loss per session falls again at long delays because stale quotes sit
+  away from the market and rarely fill; loss per fill is the fair measure.
+- Blind quoting barely worsens on CL and NG: under the through rule every
+  blind fill is already one where the price runs over us.
+- Under the pessimistic rule every policy would need a rebate of $1.57 to
+  $3.96 a side to break even.
+- Bridge (dollars per session): the forecast closes $1,600–33,500 of the
+  loss, the front of the queue adds $700–5,200, removing fees adds
+  $300–3,400. Best case per contract traded: about $0.04 on crude and
+  $0.74 on copper.
+
+**Conclusion.** The forecast is a real input to a quoting engine, and the
+backtest shows what decides whether it pays: speed (steepest at the fast
+end, below what we can measure), queue position (corn turns profitable
+only at the front), fees (member or market-maker rates), and size and
+breadth to make an edge of cents per contract worth running. These are
+upper bounds; none shows the architecture would be profitable. Output:
+`data/mm_latency.{log,csv}`, `data/mm_breakeven.csv`.

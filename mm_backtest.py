@@ -122,18 +122,30 @@ def split_sessions(seg, session):
     return np.cumsum(new)
 
 
-def simulate(bid, ask, bsz, asz, seg, allow_bid, allow_ask, mode="through", max_hold=MAX_HOLD):
+def simulate(bid, ask, bsz, asz, seg, allow_bid, allow_ask, mode="through", max_hold=MAX_HOLD,
+             delay=0):
     """
     Prices in integer ticks. Returns fills as arrays (index, side, price,
     forced): side +1 bought, -1 sold. Every segment ends flat.
+
+    delay: seconds by which our view of the book lags the market. Quotes set
+    at the end of second i are based on the book (and the policy's flags) at
+    second i - delay, while fills happen against the real book. A stale bid
+    at or above the real ask buys at that ask (we take liquidity); a stale bid
+    above the real best bid is filled at its price at the next second (it is
+    picked off). With delay 0 neither can happen and the results are those of
+    the undelayed simulation. Only the "through" fill rule is defined with a
+    delay, since the queue at a stale price is unknown.
     """
+    if delay and mode != "through":
+        raise ValueError("delay is only defined for the 'through' fill rule")
     bid, ask = bid.tolist(), ask.tolist()
     bsz, asz = bsz.tolist(), asz.tolist()
     seg, allow_bid, allow_ask = seg.tolist(), allow_bid.tolist(), allow_ask.tolist()
     queue = mode == "queue"
     F_i, F_side, F_px, F_forced = [], [], [], []
     n = len(bid)
-    pos, t_in = 0, 0
+    pos, t_in, start = 0, 0, 0
     qb = qa = None                 # resting prices
     ahead_b = ahead_a = 0.0        # size ahead of us
     last_b = last_a = 0.0          # displayed size at our price last second
@@ -141,6 +153,7 @@ def simulate(bid, ask, bsz, asz, seg, allow_bid, allow_ask, mode="through", max_
         b, a = bid[i], ask[i]
         if i and seg[i] != seg[i - 1]:
             qb = qa = None         # segment change: previous one already flat
+            start = i
         # 1. fills on quotes placed at the end of an earlier second
         if qb is not None:
             hit = b < qb or a <= qb
@@ -178,20 +191,36 @@ def simulate(bid, ask, bsz, asz, seg, allow_bid, allow_ask, mode="through", max_
         if end:
             qb = qa = None
             continue
-        # 3. quotes for the next second
-        want_b = pos < 1 and (pos < 0 or allow_bid[i])
-        want_a = pos > -1 and (pos > 0 or allow_ask[i])
-        if a <= b:                 # crossed or locked book: stand aside
+        # 3. quotes for the next second, from the book as we see it
+        k = max(i - delay, start)
+        bs, as_ = bid[k], ask[k]
+        want_b = pos < 1 and (pos < 0 or allow_bid[k])
+        want_a = pos > -1 and (pos > 0 or allow_ask[k])
+        if as_ <= bs:              # crossed or locked book: stand aside
             want_b = want_a = False
         if want_b:
-            if qb != b:
-                qb, ahead_b = b, bsz[i]
+            if qb != bs:
+                if bs >= a:        # stale bid crosses the real ask: we buy there
+                    F_i.append(i); F_side.append(1); F_px.append(a); F_forced.append(0)
+                    if pos == 0:
+                        t_in = i
+                    pos += 1
+                    qb = None
+                else:
+                    qb, ahead_b = bs, bsz[i]
             last_b = bsz[i]
         else:
             qb = None
-        if want_a:
-            if qa != a:
-                qa, ahead_a = a, asz[i]
+        if want_a and pos > -1:
+            if qa != as_:
+                if as_ <= b:       # stale offer crosses the real bid: we sell there
+                    F_i.append(i); F_side.append(-1); F_px.append(b); F_forced.append(0)
+                    if pos == 0:
+                        t_in = i
+                    pos -= 1
+                    qa = None
+                else:
+                    qa, ahead_a = as_, asz[i]
             last_a = asz[i]
         else:
             qa = None
@@ -240,7 +269,8 @@ def policy_flags(name, sec, minutes, fc_ridge, fc_kernel, book, eligible, rng):
     return ab, aa
 
 
-def run(symbol, seed=0):
+def prepare(symbol):
+    """The per-second book, forecasts and test sessions for one contract."""
     tick = TICK[symbol]
     g = to_grid(load(symbol))
     z = np.load(os.path.join(_ROOT, "data", f"kernel_paired_{symbol}.npz"))
@@ -252,8 +282,6 @@ def run(symbol, seed=0):
     bid = np.rint(g["bid"].to_numpy() / tick).astype(np.int64)
     ask = np.rint(g["ask"].to_numpy() / tick).astype(np.int64)
     bsz, asz = g["bsz"].to_numpy(float), g["asz"].to_numpy(float)
-    mid = (bid + ask) / 2.0
-    book = (bsz - asz) / np.maximum(bsz + asz, 1)
     session = (sec + 2 * 3600) // 86400
     seg = split_sessions(seg, session)
     eligible = minute_flags(sec, minutes, np.isfinite(fr))
@@ -262,8 +290,18 @@ def run(symbol, seed=0):
     counts = pd.Series(session[eligible]).value_counts()
     test_sessions = np.sort(counts.index[counts >= MIN_SESSION_SECONDS].to_numpy())
     eligible &= np.isin(session, test_sessions)
-    fee = FEE_USD / TICK_USD[symbol]
-    print(f"\n{symbol}: dropped {(~valid).sum():,} seconds with one side of the book empty", flush=True)
+    return dict(sec=sec, bid=bid, ask=ask, bsz=bsz, asz=asz, seg=seg, session=session,
+                mid=(bid + ask) / 2.0, book=(bsz - asz) / np.maximum(bsz + asz, 1),
+                minutes=minutes, fr=fr, fk=fk, eligible=eligible, test_sessions=test_sessions,
+                dropped=int((~valid).sum()), fee=FEE_USD / TICK_USD[symbol])
+
+
+def run(symbol, seed=0):
+    d = prepare(symbol)
+    sec, bid, ask, bsz, asz, seg = d["sec"], d["bid"], d["ask"], d["bsz"], d["asz"], d["seg"]
+    session, mid, book, eligible = d["session"], d["mid"], d["book"], d["eligible"]
+    minutes, fr, fk, test_sessions, fee = d["minutes"], d["fr"], d["fk"], d["test_sessions"], d["fee"]
+    print(f"\n{symbol}: dropped {d['dropped']:,} seconds with one side of the book empty", flush=True)
     print(f"{symbol}: {eligible.sum():,} test seconds in {len(np.unique(session[eligible]))} sessions",
           flush=True)
     rows, per = [], {}
