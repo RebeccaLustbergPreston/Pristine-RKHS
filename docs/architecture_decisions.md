@@ -1272,8 +1272,20 @@ direction remains below cost (entry 27). Output: `data/kernel_fair.{log,csv}`.
 ## 30. A market maker would use the volatility forecast to stand aside; it removes 70–85% of the loss but does not make quoting pay
 
 *8 November 2026 · Status: measured · Code: `mm_backtest.py`,
-`test_mm_backtest.py`, `mm_suite_check.py` (run of `mm_backtest.py` with
-sha256 8585400…, logged in `data/mm_backtest.log`)*
+`test_mm_backtest.py`, `mm_suite_check.py`, `mm_scorecard.py`,
+`test_mm_scorecard.py` (run of `mm_backtest.py` with sha256 8182568…,
+logged in `data/mm_backtest.log`)*
+
+**Correction (same day).** The first version of this entry (commit
+45240c3) booked cash flows to the session in which each fill happened. A
+few segments run one second past the 22:00 UTC session boundary, so a
+position opened in one session and closed in that last second split its
+buy and sell across two sessions, leaving one-second "sessions" of about
+±$71,000. Totals were unaffected, but every per-session statistic (t,
+Sharpe, bootstrap intervals) was distorted. Positions are now closed at
+every session boundary, sessions with less than an hour of test data are
+not scored, and a test covers it. All numbers below are from the
+corrected run; the verdict did not change.
 
 **Context.** Entries 27–29 show the 1-minute volatility forecast is real but
 that no directional use of the features clears a 1-tick cost. A market
@@ -1284,31 +1296,32 @@ ticks; in the loudest, 4.7).
 
 **Decision.** Simulate one-lot quoting at the best bid and ask on the
 per-second book over the test period of the kernel_paired forecasts
-(about 280 sessions per contract). Position limit ±1 lot; a position held
-120 s, or open at a segment's end, is closed by crossing the spread; fees
-$1 per contract per side. Without our queue position, two fill rules
-bracket the truth: *through* (filled only when the price trades through
-our level: certain, pessimistic) and *queue* (also filled when the
-displayed size at our level has shrunk by more than the size ahead of us
-when we joined: optimistic, since it counts every cancellation as ahead
-of us). Policies: always quote; random pulls (as often as the gate);
-**vol** (quote only in minutes whose ridge forecast is below the median of
-its previous 20,000 forecasts, causal); vol with the ridge + kernel
-forecast; book imbalance side-skipping (|imbalance| > 0.5); vol plus book.
-Seconds with one side of the book empty (0.2–2.7%) are dropped and split
-their segment. **Rule, fixed and logged before running:** the gate earns a
-place if vol beats both always and random (paired t ≥ 2) on ≥ 3 of 4
-contracts under both fill rules; a policy goes on to the risk layers only
-if its own net profit is positive with t ≥ 2 under the through rule.
+(260–273 sessions per contract). Position limit ±1 lot; a position held
+120 s, or open at a segment's end or a session boundary, is closed by
+crossing the spread; fees $1 per contract per side. Without our queue
+position, two fill rules bracket the truth: *through* (filled only when
+the price trades through our level: certain, pessimistic) and *queue*
+(also filled when the displayed size at our level has shrunk by more than
+the size ahead of us when we joined: optimistic, since it counts every
+cancellation as ahead of us). Policies: always quote; random pulls (as
+often as the gate); **vol** (quote only in minutes whose ridge forecast is
+below the median of its previous 20,000 forecasts, causal); vol with the
+ridge + kernel forecast; book imbalance side-skipping (|imbalance| > 0.5);
+vol plus book. Seconds with one side of the book empty (0.2–2.7%) are
+dropped and split their segment. **Rule, fixed and logged before running:**
+the gate earns a place if vol beats both always and random (paired t ≥ 2)
+on ≥ 3 of 4 contracts under both fill rules; a policy goes on to the risk
+layers only if its own net profit is positive with t ≥ 2 under the through
+rule.
 
-**Result** (net dollars per session per lot; profit per fill before fees
-in ticks, through / queue):
+**Result** (net dollars per session per lot, through / queue; profit per
+fill before fees in ticks):
 
 | | always | vol gate | vol − always (t) | vol − random (t) | kernel gate − ridge gate (t) |
 |---|---|---|---|---|---|
-| CL | −37,257 / −30,307 (−0.33 / −0.17 t) | −6,011 / −2,902 (−0.18 / +0.005 t) | +31,246 (23.9) | +13,772 (7.0) | +147 (5.2) |
-| NG | −15,205 / −12,463 (−0.37 / −0.21 t) | −2,348 / −1,311 (−0.24 / −0.05 t) | +12,857 (19.6) | +5,844 (7.4) | +24 (0.1) |
-| HG | −26,744 / −15,548 (−0.19 / −0.04 t) | −5,762 / −815 (−0.13 / +0.06 t) | +20,983 (19.4) | +8,822 (3.5) | +183 (6.6) |
+| CL | −39,962 / −32,509 (−0.33 / −0.17 t) | −6,450 / −3,116 (−0.18 / +0.004 t) | +33,512 (27.2) | +14,769 (23.8) | +158 (5.2) |
+| NG | −16,463 / −13,497 (−0.37 / −0.21 t) | −2,546 / −1,425 (−0.24 / −0.05 t) | +13,917 (25.0) | +6,324 (22.2) | +26 (3.2) |
+| HG | −28,116 / −16,346 (−0.19 / −0.04 t) | −6,058 / −858 (−0.13 / +0.06 t) | +22,059 (22.6) | +9,274 (18.2) | +192 (6.6) |
 | ZC | −2,192 / **+682** (−0.25 / +0.13 t) | −626 / +51 (−0.25 / +0.09 t) | +1,566 (32.6) | +612 (25.0) | +14 (4.8) |
 
 (Comparison columns under the through rule; the queue rule agrees except
@@ -1316,38 +1329,48 @@ for corn, below.)
 
 - **The gate earns a place by the rule:** 4/4 contracts under through, 3/4
   under queue. It quotes half the minutes but takes a quarter of the
-  fills, and each fill is less toxic (crude's 60-second markout −0.18
-  ticks against −0.33). Random pulls halve the fills but not the toxicity.
+  fills, and on CL, NG and HG each fill is less toxic (crude's 60-second
+  markout −0.18 ticks against −0.33). Random pulls halve the fills but not
+  the toxicity, and remove about half the loss; the gate removes 70–85%.
   A stationary block bootstrap of the per-session differences (mean block
-  5 sessions; first two warm-up sessions dropped) gives 95% intervals
-  that exclude zero for every through-rule comparison above except the
-  kernel on NG.
+  5 sessions; first two warm-up sessions dropped) gives 95% intervals that
+  exclude zero for every comparison in the table.
 - **No policy makes money under the through rule,** so none goes to the
-  Monte Carlo and stress layers. Deflated Sharpe probability ≈ 0 for every
-  best policy (48 configurations counted as trials).
+  Monte Carlo and stress layers. The losses are steady, not occasional:
+  quoting crude all the time loses on 95% of sessions, and with the gate
+  on 92%; natural gas and corn lose every session. Deflated Sharpe
+  probability ≈ 0 for every policy under the through rule (48
+  configurations counted as trials). Full scorecard (Sharpe, Sortino,
+  drawdown, profitable sessions, win/loss, best and worst session) in
+  `data/mm_scorecard.csv`.
 - **Corn is the exception, and it is about the queue.** Under the queue
-  rule, quoting corn all the time earns +$682 a session (book side-skipping
-  +$863, annualised Sharpe 22): corn's tick is wide for its volatility
-  (two-thirds of minutes the mid does not move). There the gate *loses*
-  money by standing aside. Under the through rule the same quoting loses.
-  So whether corn pays depends entirely on queue position, the thing we
-  cannot see and the thing fast market makers pay to win.
+  rule, quoting corn all the time earns +$682 a session on 92% of
+  sessions (book side-skipping +$867, annualised Sharpe 22): corn's tick
+  is wide for its volatility (two-thirds of minutes the mid does not
+  move). There the gate *loses* money by standing aside. Under the through
+  rule the same quoting loses every session. So whether corn pays depends
+  entirely on queue position, the thing we cannot see and the thing fast
+  market makers pay to win.
 - **The kernel earns a small practical place.** Gating on the ridge +
-  kernel forecast instead of ridge alone saves $14–183 a session on CL, HG
-  and ZC (t 4.8–7.3 under both rules), 2–3% of the remaining loss; nothing
-  on NG. Part of it is quoting slightly less often, but on corn under the
-  queue rule, where fills are profitable, the kernel gate has the same fill
+  kernel forecast instead of ridge alone saves $14–192 a session on all
+  four contracts (t 3.2–7.3 under both rules), 1–3% of the remaining loss.
+  Part of it is quoting slightly less often, but on corn under the queue
+  rule, where fills are profitable, the kernel gate has the same fill
   count and a better profit per fill (+0.099 against +0.094 ticks).
-- Book imbalance side-skipping alone barely helps (crude −$33,594 against
-  −$37,257); with the gate it adds nothing significant except on corn.
+- **Book imbalance helps only alongside the gate.** On its own, skipping
+  the side the book leans against barely helps (crude −$36,032 against
+  −$39,962). On top of the gate it saves a further 8–13% of the loss on
+  CL, NG and HG and 60% on corn under the through rule (t 20–33); under
+  the queue rule it is mixed and costs money on copper.
 
 **Conclusion.** The volatility forecast does what a market maker would want
-from it: it tells it when to stand aside, removing 70–85% of the loss
-from quoting blind and far more than standing aside at random. It does not
-make one-lot quoting at a 1-second reaction time profitable on CL, NG or HG
+from it: it tells it when to stand aside, removing 70–85% of the loss from
+quoting blind and far more than standing aside at random. It does not make
+one-lot quoting at a 1-second reaction time profitable on CL, NG or HG
 under either fill rule after fees. Corn might pay a market maker near the
 front of the queue. Limits: one snapshot per second (real market makers
-react in microseconds, so our quotes are picked off more than theirs);
-no queue position; one lot; fees assumed. Output:
+react in microseconds, so our quotes are picked off more than theirs); no
+queue position; one lot; fees assumed. Output:
 `data/mm_backtest.{log,csv}`, `data/mm_sessions_<SYM>.csv`,
-`data/mm_suite_check.{log,csv}`.
+`data/mm_suite_check.{log,csv}`, `data/mm_scorecard.{log,csv}`,
+`data/mm_equity.csv`.

@@ -124,6 +124,21 @@ def test_dropped_second_splits_segment():
     assert out.tolist() == [1, 1, 2, 3, 3]
 
 
+def test_no_position_crosses_a_session():
+    # long from the first session; the boundary must close it there, so each
+    # session's cash flows net to a price difference, not a price level
+    bid = np.array([100, 99, 99, 99, 99, 99])
+    ask = bid + 1
+    session = np.array([1, 1, 1, 2, 2, 2])
+    seg = mm.split_sessions(np.zeros(6, int), session)
+    n = 6
+    f = mm.simulate(bid, ask, np.full(n, 10.0), np.full(n, 10.0), seg,
+                    np.ones(n, bool), np.zeros(n, bool), "through", 1000)
+    pnl = mm.session_pnl(f, session, 0.0)
+    assert (abs(pnl) < 10).all(), pnl
+    assert (np.cumsum(f[1])[np.isin(f[0], [2])] == 0).all()
+
+
 if __name__ == "__main__":
     print("mm_backtest tests:")
     for name, fn in list(globals().items()):

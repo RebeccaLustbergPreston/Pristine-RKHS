@@ -33,7 +33,9 @@ the end of the second):
                         cancellation as if it were ahead of us.
   exits      a position still open after MAX_HOLD seconds is closed by
              crossing the spread, as is any position at the end of a
-             segment (a gap of over a minute or a contract switch).
+             segment (a gap of over a minute, a contract switch, or the
+             session boundary at 22:00 UTC). Sessions with less than an hour
+             of test data (one-second stubs at a boundary) are not scored.
   costs      FEE_USD per contract per side (exchange and clearing), on every
              fill, passive or not. Results are also reported before fees.
 
@@ -75,6 +77,7 @@ _ROOT = os.path.dirname(os.path.abspath(__file__))
 TICK_USD = {"CL": 10.0, "NG": 10.0, "HG": 12.5, "ZC": 12.5}
 FEE_USD = 1.0
 MAX_HOLD = 120
+MIN_SESSION_SECONDS = 3600
 GATE_Q = 0.5
 GATE_WINDOW = 20_000
 BOOK_K = 0.5
@@ -108,6 +111,15 @@ def valid_segments(seg, valid):
     prev_ok = np.r_[False, valid[:-1]]
     new = ~prev_ok | np.r_[True, seg[1:] != seg[:-1]]
     return np.cumsum(new)[valid]
+
+
+def split_sessions(seg, session):
+    """Segment ids that also break at every session boundary, so that no
+    position is carried from one session into the next and each session's
+    profit is complete in itself."""
+    seg, session = np.asarray(seg), np.asarray(session)
+    new = np.r_[True, (seg[1:] != seg[:-1]) | (session[1:] != session[:-1])]
+    return np.cumsum(new)
 
 
 def simulate(bid, ask, bsz, asz, seg, allow_bid, allow_ask, mode="through", max_hold=MAX_HOLD):
@@ -243,18 +255,24 @@ def run(symbol, seed=0):
     mid = (bid + ask) / 2.0
     book = (bsz - asz) / np.maximum(bsz + asz, 1)
     session = (sec + 2 * 3600) // 86400
+    seg = split_sessions(seg, session)
     eligible = minute_flags(sec, minutes, np.isfinite(fr))
+    # a session counts only with at least MIN_SESSION_SECONDS of test data;
+    # this drops one-second stubs where a segment runs onto a boundary
+    counts = pd.Series(session[eligible]).value_counts()
+    test_sessions = np.sort(counts.index[counts >= MIN_SESSION_SECONDS].to_numpy())
+    eligible &= np.isin(session, test_sessions)
     fee = FEE_USD / TICK_USD[symbol]
     print(f"\n{symbol}: dropped {(~valid).sum():,} seconds with one side of the book empty", flush=True)
     print(f"{symbol}: {eligible.sum():,} test seconds in {len(np.unique(session[eligible]))} sessions",
           flush=True)
     rows, per = [], {}
-    test_sessions = np.unique(session[eligible])
     for mode in FILLS:
         for name in POLICIES:
             rng = np.random.default_rng(seed)
             ab, aa = policy_flags(name, sec, minutes, fr, fk, book, eligible, rng)
             f = simulate(bid, ask, bsz, asz, seg, ab, aa, mode)
+            assert np.isin(session[f[0]], test_sessions).all(), "fill outside the scored sessions"
             net = session_pnl(f, session, fee).reindex(test_sessions, fill_value=0.0)
             gross = session_pnl(f, session, 0.0).reindex(test_sessions, fill_value=0.0)
             per[(mode, name)] = net * TICK_USD[symbol]
