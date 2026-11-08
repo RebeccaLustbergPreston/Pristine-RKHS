@@ -14,6 +14,7 @@ import pandas as pd
 from feature_alignment import (
     expanding_zscore,
     expanding_mean,
+    expanding_minmax,
     to_epoch_seconds,
     build_master_bar_schedule,
     align_to_schedule,
@@ -259,6 +260,24 @@ def test_guard_catches_clipped_oos_window():
 def test_guard_passes_a_healthy_target():
     y = np.random.default_rng(3).normal(0, 1e-3, 1_000)
     check_target_not_degenerate(y, label="healthy")
+
+
+def test_expanding_minmax_is_causal():
+    rng = np.random.default_rng(5)
+    x = rng.normal(size=500)
+    a = expanding_minmax(x)
+    y = x.copy()
+    y[400:] *= 100                      # a far more extreme future
+    b = expanding_minmax(y)
+    assert np.allclose(a[:400], b[:400])
+    assert (a >= 0).all() and (a <= 1).all()
+    assert (a[:20] == 0).all()
+
+
+def test_expanding_minmax_matches_full_sample_at_the_end():
+    x = np.random.default_rng(6).normal(size=300)
+    full = (x - x.min()) / (x.max() - x.min() + 1e-8)
+    assert np.isclose(expanding_minmax(x)[-1], full[-1])
 
 
 if __name__ == "__main__":

@@ -209,7 +209,9 @@ The architecture the April report proposed, and the one worth building:
 
 The existing VPIN/Hawkes position-sizing gate is already a small version of
 this idea on one market, and it was the one component that behaved sensibly
-in testing.
+in testing. (Caveat: until 8 Nov 2026 it scaled VPIN and Hawkes by their
+whole-sample extremes, a lookahead; see decision log 32. Recheck before
+citing it.)
 
 ---
 

@@ -355,3 +355,22 @@ def expanding_zscore(
     out[~np.isfinite(out)] = 0.0
 
     return out[:, 0] if one_d else out
+
+
+def expanding_minmax(x: np.ndarray, min_periods: int = 20, eps: float = 1e-8) -> np.ndarray:
+    """
+    Scale x to [0, 1] against the smallest and largest values seen so far.
+
+    The v2 position-sizing gate used (x - x.min()) / (x.max() - x.min()) over
+    the whole sample, so a bar's position size depended on how extreme VPIN
+    and Hawkes would get later. Row i here sees only rows 0..i. Rows before
+    `min_periods` return 0 (no scaling down).
+    """
+    x = np.asarray(x, dtype=float)
+    lo = np.minimum.accumulate(x)
+    hi = np.maximum.accumulate(x)
+    out = (x - lo) / (hi - lo + eps)
+    out[:min(min_periods, len(x))] = 0.0
+    out[~np.isfinite(out)] = 0.0
+    return np.clip(out, 0.0, 1.0)
+

@@ -95,7 +95,7 @@ from data_loader import DataLoader, LOBSnapshot
 from feature_alignment import (
     to_epoch_seconds, build_master_bar_schedule, align_fast_features,
     first_valid_bar, check_target_not_degenerate, reindex_daily,
-    expanding_zscore, expanding_mean,
+    expanding_zscore, expanding_mean, expanding_minmax,
 )
 
 # Kernels
@@ -1414,14 +1414,15 @@ def main():
         if gate_vpin is not None:
             print(f"\n  Position-sizing gates (from raw order-flow):")
             # VPIN gate: high VPIN → reduce position (toxic flow)
-            # Normalize to [0.5, 1.0]: low VPIN → 1.0 (full size), high VPIN → 0.5
-            vpin_pct = (gate_vpin - gate_vpin.min()) / (gate_vpin.max() - gate_vpin.min() + 1e-8)
+            # Scale to [0.5, 1.0] against the range seen so far (causal; a
+            # full-sample min/max leaked the future, decision log 32)
+            vpin_pct = expanding_minmax(gate_vpin)
             gate_vpin_sizing = 1.0 - 0.5 * vpin_pct  # invert: high VPIN → smaller position
             print(f"    VPIN gate: mean={gate_vpin_sizing.mean():.3f} "
                   f"[{gate_vpin_sizing.min():.3f}, {gate_vpin_sizing.max():.3f}]")
 
             # Hawkes burst gate: high burst → reduce position (unstable microstructure)
-            burst_pct = (gate_hawkes - gate_hawkes.min()) / (gate_hawkes.max() - gate_hawkes.min() + 1e-8)
+            burst_pct = expanding_minmax(gate_hawkes)
             gate_hawkes_sizing = 1.0 - 0.5 * burst_pct
             print(f"    Hawkes gate: mean={gate_hawkes_sizing.mean():.3f} "
                   f"[{gate_hawkes_sizing.min():.3f}, {gate_hawkes_sizing.max():.3f}]")

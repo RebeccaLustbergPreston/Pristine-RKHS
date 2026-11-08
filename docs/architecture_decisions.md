@@ -1431,3 +1431,41 @@ only at the front), fees (member or market-maker rates), and size and
 breadth to make an edge of cents per contract worth running. These are
 upper bounds; none shows the architecture would be profitable. Output:
 `data/mm_latency.{log,csv}`, `data/mm_breakeven.csv`.
+
+## 32. The v2 position-sizing gate scaled by whole-sample extremes; now causal
+
+*8 November 2026 · Status: fixed and measured · Code: `expanding_minmax` in
+`feature_alignment.py`, `run_backtest.py`, `test_feature_alignment.py`
+(two new tests) · Logs: `data/validate_pipeline_gatefix.log`*
+
+**Context.** Checking the report's pipeline diagram against Run 25
+(`ARCH_VERSION=v2`) showed that v2 scales every position by a gate built
+from raw VPIN and Hawkes burst ratio (on by default, `POSITION_GATE=1`):
+size × (1 − ½·VPIN scaled) × (1 − ½·burst scaled), so as low as a quarter.
+Each series was scaled to [0, 1] with its minimum and maximum over the
+**whole sample**, so a bar's position size depended on how extreme order
+flow would get later: the same kind of leak as bug 5, in sizing rather than
+direction. `TODO.md` had called this gate "the one component that behaved
+sensibly in testing".
+
+**Decision.** Scale each series against the minimum and maximum seen so
+far (`expanding_minmax`; rows before 20 bars are not scaled down). Tests:
+changing the future does not change earlier values, and the last value
+equals the full-sample scaling.
+
+**Result.** The effect was small. Run 25 configuration, seed 0, before /
+after: combined gate mean 0.694 / 0.665; average size scale on active bars
+0.621 / 0.570; positions active 22.0% / 22.0%; trades 17 / 17; Sharpe 0.36
+/ 0.34 (Sharpe is not informative here; shown only to say the change is
+small). Falsification suite after the fix (4 modes × 3 seeds) passes the
+leakage check (|OOS corr| under a shuffled target 0.0475, tolerance 0.05,
+close to the limit); real features −0.48 ± 0.89 Sharpe against noise
+−0.32 ± 0.12 and shuffled target −0.15 ± 0.79: still not separable, as
+before.
+
+**Conclusion.** A 16th leak, found by checking a figure against the code
+rather than by a result looking too good. It did not drive Run 25's
+results, but the gate's "sensible" behaviour should not be cited without
+rerunning it causally. The report's diagram now shows v2 as built: the four
+order-flow kernels merged by PCA into one OrderFlow kernel, five stage-1
+kernels, and the order-flow sizing gate.
