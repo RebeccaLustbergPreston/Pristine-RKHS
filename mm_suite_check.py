@@ -12,7 +12,7 @@ and so does not quote at all (which would flatter it against "always").
   1. Stationary block bootstrap (Politis & Romano 1994, mean block
      BLOCK sessions, analytics/bootstrap_mc.py) of the per-session
      difference between two policies: a 95% interval that allows for
-     losses clustering in runs of days, as a check on the paired t.
+     good and bad days clustering in runs, as a check on the paired t.
   2. Deflated Sharpe ratio (backtesting/metrics.py) for every policy's own
      profit stream, with every configuration tried counted as a trial.
   3. The rule from mm_backtest.py: a policy goes on to the risk layers
