@@ -1469,3 +1469,44 @@ results, but the gate's "sensible" behaviour should not be cited without
 rerunning it causally. The report's diagram now shows v2 as built: the four
 order-flow kernels merged by PCA into one OrderFlow kernel, five stage-1
 kernels, and the order-flow sizing gate.
+
+## 33. The short-horizon results hold in every quarter; the forecaster trains in seconds
+
+*12 November 2026 · Status: measured · Code: `stability_check.py`,
+`test_stability_check.py`, `timing_check.py` · Logs:
+`data/stability_check.log`, `data/timing_check.log`*
+
+**Context.** Two questions the final presentation will face: is "18 months"
+one lucky stretch, and could the forecaster run live? Neither needs a new
+model, only existing outputs.
+
+**Stability.** Three results scored per calendar quarter, from data already
+on disk: book imbalance's per-session IC with the next minute's move (every
+session, no model); the walk-forward ridge forecast's per-session IC with
+the next minute's volatility (`kernel_paired.py`'s saved forecasts); and
+the market-making forecast gate's per-session profit over quoting all the
+time and over standing aside at random (entry 30, pessimistic rule).
+
+| per quarter (lowest to highest) | CL | NG | HG | ZC |
+|---|---|---|---|---|
+| book imbalance IC (6 quarters) | +0.055 to +0.072 | +0.066 to +0.083 | +0.050 to +0.099 | +0.198 to +0.274 |
+| volatility forecast IC (5) | 0.81 to 0.84 | 0.68 to 0.74 | 0.76 to 0.81 | 0.37 to 0.48 |
+| gate vs random, $/session (5) | +12,897 to +17,479 | +4,807 to +8,999 | +5,877 to +15,297 | +477 to +702 |
+| weakest quarter's t | 4.6 | 7.8 | 8.5 | 4.8 |
+
+Every result keeps its sign with t ≥ 4.6 in every quarter on every
+contract. The forecast and backtest quarters start in 2023 Q4 (12–16
+sessions in it) because the first 30% of sessions trains the model. This
+rules out one lucky stretch inside the window; it says nothing about a
+different regime.
+
+**Speed** (CL, Apple M3, the model of entry 29; medians of three runs where
+repeated): tuning 7.1 s; ridge refit on 240 sessions (270,652 minutes)
+0.8 s; kernel refit 9.4 s; one minute's features about 7 µs (batch); one
+forecast, ridge plus kernel, about 34 µs. A full nightly or hourly refit is
+cheap; a live system's costs are the real-time feed and order-book
+processing, and for market making, microsecond reaction, which is
+infrastructure rather than model.
+
+**Conclusion.** Both questions now have measured answers in the report
+("Do the results hold over time?", "Could it run live?").
