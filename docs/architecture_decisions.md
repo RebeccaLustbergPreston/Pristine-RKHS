@@ -1510,3 +1510,52 @@ infrastructure rather than model.
 
 **Conclusion.** Both questions now have measured answers in the report
 ("Do the results hold over time?", "Could it run live?").
+
+## 34. At one second the kernel also improves direction, a little; at 5–10 seconds only on gas and corn
+
+*12 November 2026 · Status: measured · Code: `seconds_check.py`,
+`test_seconds_check.py` (run logged in `data/seconds_check.log`, sha256
+b7ca6f9…)*
+
+**Question.** Every kernel test so far was at one minute or longer, where
+the kernel helped volatility a little and direction not at all. Does it
+beat a linear model on direction at seconds, where book imbalance is
+strongest and published work favours nonlinear models? Asked before anyone
+considers buying finer (microsecond or order-by-order) data.
+
+**Method.** The per-second book, 18 months, CL/NG/HG/ZC. Origins every 10
+s; horizons 1, 5, 10 s; outcome the mid move over (t, t+h] in ticks.
+Features: book and top-five imbalance, spread, log best-level sizes, OFI,
+signed trade flow and trade count over (t−h, t], the last h seconds' mid
+move, time of day. No window crosses a segment break; expiry sessions,
+crossed and one-sided books dropped. Walk-forward, expanding window from
+30% of sessions, refit every 40 sessions; ridge on all past rows, kernel
+(kernel_fair.py's hybrid, 4,000 random features, tuned on the latest
+60,000 rows) and a placebo ridge on the same 300,000 thinned rows. Paired
+per-session IC gain with t. **Rule, fixed before running:** a gain with
+t ≥ 2 on 3 of 4 contracts, placebo not.
+
+**Result** (IC gain over ridge, t; about 2.1–3.2 million scored seconds per
+contract per horizon):
+
+| | CL | NG | HG | ZC |
+|---|---|---|---|---|
+| 1 s | +0.0053 (17.6) | +0.0075 (18.2) | +0.0044 (15.6) | −0.0007 (−1.2) |
+| 5 s | −0.0005 (−0.6) | +0.0069 (15.2) | +0.0004 (0.7) | +0.0064 (14.2) |
+| 10 s | −0.0009 (−0.9) | +0.0042 (11.6) | +0.0016 (0.9) | +0.0078 (17.2) |
+
+- Passes at 1 s (3/4); fails at 5 and 10 s (2/4, gas and corn, the two
+  contracts whose book signal lasts longest).
+- The placebo never gains (largest +0.0005, t 1.1); it is sometimes
+  slightly below full ridge (t to −5.5) because it trains on fewer rows,
+  as the kernel does, so the kernel's gain is if anything understated.
+- Ridge barely beats book imbalance alone (CL 1 s: 0.195 against 0.191).
+- Tuning picks a spread of widths, mostly γ × 0.3–3: real curvature, not a
+  near-linear kernel.
+
+**Conclusion.** The kernel finds real but small curvature in one-second
+direction: about 2–6% of ridge's IC on three contracts. Finer data could
+add to it, order-by-order data most (queue information we lack), but a few
+percent of an edge worth a fraction of a tick does not make direction
+tradeable as a taker. Updates entries 28–29's "the kernels add nothing to
+direction": true at one minute and beyond, not at one second.
